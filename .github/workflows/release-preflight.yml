@@ -1,0 +1,38 @@
+name: Release preflight
+
+# Guards the one failure this repository cannot undo: publishing a version
+# whose number already exists on crates.io while its contents have moved on.
+# crates.io versions are immutable, so a missed bump ships a crate that no
+# longer matches what consumers compile against.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  semver:
+    name: Local API vs published baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # There is nothing to compare the first release against, and
+      # cargo-semver-checks treats a missing baseline as an error rather than
+      # as "no findings". Ask the index directly instead of failing the very
+      # release that creates the baseline.
+      - id: baseline
+        run: |
+          if curl -sfL https://index.crates.io/sh/ad/shaderloom > /dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Not yet on crates.io; this release establishes the baseline."
+          fi
+      - if: steps.baseline.outputs.exists == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@v2
