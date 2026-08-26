@@ -9,19 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0](https://github.com/water-rs/shaderloom/releases/tag/v0.1.0) - 2026-08-26
 
+First release as a standalone crate. The code previously lived inside the
+WaterUI repository; its history is preserved here.
+
 ### Added
 
-- *(ffi)* [**breaking**] gate the GPU stack behind a default-on `gpu` feature
-- *(filtrate)* give hosts a shared per-device shader module cache
-
-### Fixed
-
-- assert the value, not the emptiness predicate
-
-### Other
-
-- stand shaderloom up as its own repository
-- *(shaderloom)* say why the README's examples are not compiled
-- Give every unsafe a reason the compiler can check, workspace-wide
-- upgrade workspace dependencies
-- Add cross-platform shader AOT with Shaderloom
+- Compile WGSL during a package build and embed the result, so native backends
+  load a shader module without translating WGSL at runtime.
+- Emit each backend's own artifact: `MetalLib` for Metal, DXIL for Direct3D 12,
+  SPIR-V for Vulkan. GLES and browser WebGPU keep validated WGSL, because
+  `wgpu` exposes no portable offline binary input for them; they still gain
+  build-time parsing and validation.
+- Expose a shared per-device shader module cache, so hosts compiling the same
+  module for several surfaces pay for it once.
+- Keep the runtime dependency to `wgpu` alone. `naga` enters only through the
+  optional `build` feature, so a consumer does not ship a shader compiler.
