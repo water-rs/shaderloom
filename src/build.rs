@@ -895,7 +895,7 @@ mod tests {
         for entry in &reflection.entry_points {
             let (source, translated_name) =
                 generate_hlsl_entry_point(&module, &info, &hlsl_options, entry, "test WGSL");
-            assert!(!source.is_empty());
+            assert_ne!(source, "");
             assert!(source.contains(&translated_name));
         }
         let rust = reflection.rust_expression("test.wgsl", "test_shader");
