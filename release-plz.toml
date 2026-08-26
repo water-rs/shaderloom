@@ -1,0 +1,8 @@
+[workspace]
+pr_draft = false
+pr_labels = ["release"]
+publish = true
+release_always = true
+git_tag_enable = true
+git_release_enable = true
+changelog_update = true
