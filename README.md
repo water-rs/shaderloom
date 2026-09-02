@@ -7,6 +7,11 @@ runtime WGSL translation step on native backends.
 The crate is independent from `WaterUI`. Its runtime dependency is only `wgpu`;
 the optional `build` feature adds `naga` for build scripts.
 
+That `naga` is the one `wgpu` itself links, and each backend's writer options
+are matched to the options `wgpu` would have used for the same module at
+runtime. An embedded artifact is therefore what the runtime translator would
+have produced, not merely something the driver happens to accept.
+
 ## Backend artifacts
 
 | Runtime backend | Build-time artifact | Runtime input |

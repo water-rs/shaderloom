@@ -13,7 +13,12 @@ categories = ["graphics", "development-tools::build-utils"]
 
 [dependencies]
 wgpu = "29.0.4"
-naga = { version = "30.0.0", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
+naga = { version = "29.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
+
+[dev-dependencies]
+# The SPIR-V opcode table, so the writer-option tests name opcodes from the
+# specification instead of restating their numbers. Same version naga uses.
+spirv = "0.4"
 
 [features]
 default = []
