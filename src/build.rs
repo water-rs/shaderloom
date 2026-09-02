@@ -87,6 +87,7 @@ pub fn compile_wgsl_source(label: &str, source: &str, artifact_name: &str) {
         compile_spirv(
             &module,
             &info,
+            &reflection,
             &out_dir.join(format!("{artifact_name}.spv")),
             label,
         );
@@ -126,8 +127,14 @@ fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} must be set for shader compilation"))
 }
 
-fn compile_spirv(module: &Module, info: &ModuleInfo, output: &Path, label: &str) {
-    let words = spv::write_vec(module, info, &spv::Options::default(), None)
+fn compile_spirv(
+    module: &Module,
+    info: &ModuleInfo,
+    reflection: &ShaderReflection,
+    output: &Path,
+    label: &str,
+) {
+    let words = spv::write_vec(module, info, &reflection.spirv_options(), None)
         .unwrap_or_else(|error| panic!("SPIR-V generation failed for {label}: {error}"));
     let bytes = words
         .iter()
@@ -230,8 +237,8 @@ const fn is_msl_version_error(error: &msl::Error) -> bool {
         error,
         msl::Error::UnsupportedAttribute(_)
             | msl::Error::UnsupportedFunction(_)
-            | msl::Error::UnsupportedWritableStorageBuffer
-            | msl::Error::UnsupportedWritableStorageTexture(_)
+            | msl::Error::UnsupportedWriteableStorageBuffer
+            | msl::Error::UnsupportedWriteableStorageTexture(_)
             | msl::Error::UnsupportedRWStorageTexture
             | msl::Error::UnsupportedArrayOf(_)
             | msl::Error::UnsupportedRayTracing
@@ -442,6 +449,91 @@ impl ShaderReflection {
         );
         for (entry, translated) in self.entry_points.iter().zip(translated_names) {
             entry.metal_name.borrow_mut().clone_from(translated);
+        }
+    }
+
+    /// SPIR-V writer options equivalent to the ones wgpu's Vulkan backend uses.
+    ///
+    /// `spv::Options::default()` is naga's default, not wgpu's, and the two
+    /// disagree on flags that change generated code. The reference is
+    /// `wgpu_hal::vulkan::Adapter::open`, which builds its options from
+    /// `spv::WriterFlags::empty()` and then opts in explicitly; every field below
+    /// is set from that same starting point.
+    ///
+    /// Ahead-of-time compilation has no device, so each device-dependent option
+    /// takes the value that is valid on every Vulkan device wgpu supports rather
+    /// than the value wgpu would pick for one particular adapter:
+    ///
+    /// - `lang_version` is SPIR-V 1.0, what wgpu selects for a Vulkan 1.0 device
+    ///   and what every later device still accepts.
+    /// - `LABEL_VARYINGS` stays off. wgpu sets it except on Qualcomm, whose
+    ///   driver mishandles the names; the build cannot know the vendor and the
+    ///   flag only emits `OpName` decorations.
+    /// - `DEBUG` and `PRINT_ON_RAY_QUERY_INITIALIZATION_FAIL` stay off. wgpu ties
+    ///   them to `InstanceFlags::DEBUG`, and leaving them off also keeps the
+    ///   artifact byte-identical between debug and release build-script runs.
+    /// - `use_storage_input_output_16` stays off, so `f16` shader I/O is
+    ///   polyfilled through `f32` instead of requiring a capability the target
+    ///   device may not advertise.
+    /// - `zero_initialize_workgroup_memory` polyfills, because the native mode
+    ///   needs an extension wgpu only uses when the device reports it.
+    /// - `capabilities` is `None`. It is a writer-side gate that rejects modules
+    ///   needing more than the listed capabilities and never changes generated
+    ///   code, and the build already validates with `Capabilities::all()`.
+    /// - `task_dispatch_limits` is `None`, since those limits come from the
+    ///   device.
+    ///
+    /// Bounds checks, loop bounding, ray-query initialization tracking and
+    /// mesh-shader index clamping are all off. A passthrough binary is a trusted
+    /// module, and wgpu drops exactly these checks for trusted modules in
+    /// `wgpu_hal::vulkan::Device::compile_stage`; the MSL and HLSL options above
+    /// take the same position.
+    ///
+    /// `binding_map` reproduces the remapping wgpu performs: `wgpu-core` sorts a
+    /// bind group's entries by binding number and `wgpu-hal` then numbers the
+    /// Vulkan descriptor bindings densely from zero in that order, so a shader
+    /// whose `@binding` numbers are not contiguous would otherwise decorate its
+    /// globals with numbers the descriptor set layout never uses. With the map
+    /// populated, `fake_missing_bindings` is off, so a binding the reflection
+    /// missed fails the build instead of emitting an invalid module.
+    fn spirv_options(&self) -> spv::Options<'static> {
+        let mut binding_map = spv::BindingMap::default();
+        let mut group_bindings = BTreeMap::<u32, u32>::new();
+        for binding in &self.bindings {
+            let next = group_bindings.entry(binding.group).or_default();
+            binding_map.insert(
+                naga::ResourceBinding {
+                    group: binding.group,
+                    binding: binding.binding,
+                },
+                spv::BindingInfo {
+                    descriptor_set: binding.group,
+                    binding: *next,
+                    binding_array_size: None,
+                },
+            );
+            *next += 1;
+        }
+
+        spv::Options {
+            lang_version: (1, 0),
+            flags: spv::WriterFlags::FORCE_POINT_SIZE,
+            fake_missing_bindings: false,
+            binding_map,
+            capabilities: None,
+            bounds_check_policies: naga::proc::BoundsCheckPolicies {
+                index: naga::proc::BoundsCheckPolicy::Unchecked,
+                buffer: naga::proc::BoundsCheckPolicy::Unchecked,
+                image_load: naga::proc::BoundsCheckPolicy::Unchecked,
+                binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+            },
+            zero_initialize_workgroup_memory: spv::ZeroInitializeWorkgroupMemoryMode::Polyfill,
+            force_loop_bounding: false,
+            ray_query_initialization_tracking: false,
+            use_storage_input_output_16: false,
+            debug_info: None,
+            task_dispatch_limits: None,
+            mesh_shader_primitive_indices_clamp: false,
         }
     }
 
@@ -865,14 +957,42 @@ mod tests {
     use super::*;
 
     const TEST_SHADER: &str = include_str!("shader_test.wgsl");
+    const SPARSE_BINDING_SHADER: &str = include_str!("shader_test_sparse_bindings.wgsl");
 
-    #[test]
-    fn reflection_drives_native_binding_maps_and_rust_layout() {
-        let module = naga::front::wgsl::parse_str(TEST_SHADER).expect("test WGSL must parse");
+    fn parse_and_reflect(source: &str) -> (Module, ModuleInfo, ShaderReflection) {
+        let module = naga::front::wgsl::parse_str(source).expect("test WGSL must parse");
         let info = Validator::new(ValidationFlags::all(), Capabilities::all())
             .validate(&module)
             .expect("test WGSL must validate");
         let reflection = ShaderReflection::new(&module, &info);
+        (module, info, reflection)
+    }
+
+    /// Opcodes of every instruction in a SPIR-V module.
+    ///
+    /// A module is a five-word header followed by instructions whose first word
+    /// packs the word count in the high half and the opcode in the low half.
+    fn spirv_opcodes(words: &[u32]) -> Vec<u16> {
+        let mut opcodes = Vec::new();
+        let mut cursor = 5;
+        while cursor < words.len() {
+            let word = words[cursor];
+            let length = (word >> 16) as usize;
+            assert!(length > 0, "SPIR-V instruction must have a non-zero length");
+            opcodes.push((word & 0xffff) as u16);
+            cursor += length;
+        }
+        assert_eq!(
+            cursor,
+            words.len(),
+            "SPIR-V instructions must tile the module"
+        );
+        opcodes
+    }
+
+    #[test]
+    fn reflection_drives_native_binding_maps_and_rust_layout() {
+        let (module, info, reflection) = parse_and_reflect(TEST_SHADER);
 
         assert_eq!(reflection.bindings.len(), 1);
         assert_eq!(reflection.bindings[0].visibility, 3);
@@ -901,5 +1021,86 @@ mod tests {
         let rust = reflection.rust_expression("test.wgsl", "test_shader");
         assert!(rust.contains("CompiledShader::new"));
         assert!(rust.contains("ShaderStages::from_bits_retain(3)"));
+    }
+
+    /// The emitted module must not negate the clip-space Y of `@builtin(position)`.
+    ///
+    /// wgpu's Vulkan backend maps WebGPU clip space with a negative-height
+    /// viewport, so a writer-side flip would compose with it and turn every frame
+    /// upside down. The fixture contains no floating-point negation of its own,
+    /// which makes `OpFNegate` a direct witness of the epilogue flip; compiling
+    /// the same module with naga's defaults is the positive control that proves
+    /// this test can still see one.
+    #[test]
+    fn emitted_spirv_does_not_flip_clip_space_y() {
+        let (module, info, reflection) = parse_and_reflect(TEST_SHADER);
+
+        let words = spv::write_vec(&module, &info, &reflection.spirv_options(), None)
+            .expect("test WGSL must compile to SPIR-V");
+        assert!(
+            !spirv_opcodes(&words).contains(&(spirv::Op::FNegate as u16)),
+            "shaderloom SPIR-V must not negate clip-space Y; wgpu flips with the viewport"
+        );
+
+        let flipped = spv::write_vec(&module, &info, &spv::Options::default(), None)
+            .expect("test WGSL must compile to SPIR-V");
+        assert!(
+            spirv_opcodes(&flipped).contains(&(spirv::Op::FNegate as u16)),
+            "naga's default writer options must still emit the flip this test guards against"
+        );
+    }
+
+    /// Every option that changes generated code must match wgpu's Vulkan backend.
+    #[test]
+    fn spirv_options_match_the_vulkan_backend() {
+        let (_, _, reflection) = parse_and_reflect(TEST_SHADER);
+        let options = reflection.spirv_options();
+
+        assert!(
+            !options
+                .flags
+                .contains(spv::WriterFlags::ADJUST_COORDINATE_SPACE)
+        );
+        assert!(!options.flags.contains(spv::WriterFlags::CLAMP_FRAG_DEPTH));
+        assert!(!options.flags.contains(spv::WriterFlags::DEBUG));
+        assert!(!options.flags.contains(spv::WriterFlags::LABEL_VARYINGS));
+        assert!(options.flags.contains(spv::WriterFlags::FORCE_POINT_SIZE));
+        assert_eq!(options.lang_version, (1, 0));
+        assert!(!options.fake_missing_bindings);
+        assert!(!options.use_storage_input_output_16);
+        assert!(!options.force_loop_bounding);
+        assert_eq!(
+            options.bounds_check_policies,
+            naga::proc::BoundsCheckPolicies {
+                index: naga::proc::BoundsCheckPolicy::Unchecked,
+                buffer: naga::proc::BoundsCheckPolicy::Unchecked,
+                image_load: naga::proc::BoundsCheckPolicy::Unchecked,
+                binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
+            }
+        );
+    }
+
+    /// Descriptor bindings are numbered densely, the way wgpu numbers them.
+    #[test]
+    fn spirv_binding_map_matches_wgpu_descriptor_numbering() {
+        let (module, info, reflection) = parse_and_reflect(SPARSE_BINDING_SHADER);
+        let options = reflection.spirv_options();
+
+        let target = |group, binding| {
+            *options
+                .binding_map
+                .get(&naga::ResourceBinding { group, binding })
+                .expect("every reflected binding must be mapped")
+        };
+        assert_eq!(target(0, 0).binding, 0);
+        assert_eq!(
+            target(0, 3).binding,
+            1,
+            "wgpu allocates @binding(3) densely"
+        );
+        assert_eq!(target(0, 3).descriptor_set, 0);
+
+        spv::write_vec(&module, &info, &options, None)
+            .expect("a fully mapped module must compile without faked bindings");
     }
 }
