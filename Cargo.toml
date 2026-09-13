@@ -1,3 +1,7 @@
+[workspace]
+members = ["examples/flame"]
+resolver = "2"
+
 [package]
 name = "shaderloom"
 version = "0.1.1"
