@@ -1,0 +1,4 @@
+[package]
+type = "playground"
+name = "Flame Example"
+bundle_identifier = "com.waterui.example.flame"
