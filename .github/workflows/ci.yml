@@ -49,7 +49,9 @@ jobs:
       # which links the whole framework into one dylib; on Windows that trips
       # MSVC's 65535-object library limit (LNK1189). The example builds with its
       # default features, and `--all-features` stays on the component itself.
-      - run: cargo test -p shaderloom --all-features
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run -p shaderloom --all-features
+      - run: cargo test -p shaderloom --doc --all-features
       - run: cargo check --workspace --all-targets
 
   lint:
