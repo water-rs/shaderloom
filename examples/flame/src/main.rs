@@ -16,7 +16,11 @@ const FILM_SHADER: CompiledShader = include!(concat!(env!("OUT_DIR"), "/film.rs"
 
 fn main() {
     let event_loop = EventLoop::new().expect("failed to create the event loop");
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // `Wait`, not `Poll`: the animation is driven by `request_redraw`, so the
+    // loop can park whenever no redraw is queued. Under macOS App Nap the
+    // window server stops delivering draws while the window is occluded,
+    // which suspends the redraw chain instead of spinning a core.
+    event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = FlameApp::default();
     event_loop.run_app(&mut app).expect("event loop failed");
 }
@@ -136,7 +140,12 @@ impl ApplicationHandler for FlameApp {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => self.configure_surface(),
+            WindowEvent::Resized(_) => {
+                self.configure_surface();
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let (Some(window), Some(surface), Some(device), Some(queue), Some(config)) = (
                     self.window.as_ref(),
@@ -147,6 +156,9 @@ impl ApplicationHandler for FlameApp {
                 ) else {
                     return;
                 };
+                // Queue the next frame before anything else: every early
+                // return below must leave the redraw chain alive.
+                window.request_redraw();
                 let size = window.inner_size();
                 if size.width == 0 || size.height == 0 {
                     return;
@@ -156,6 +168,9 @@ impl ApplicationHandler for FlameApp {
                     | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
                     wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                         self.configure_surface();
+                        if let Some(window) = self.window.as_ref() {
+                            window.request_redraw();
+                        }
                         return;
                     }
                     wgpu::CurrentSurfaceTexture::Timeout
@@ -178,7 +193,6 @@ impl ApplicationHandler for FlameApp {
                     config.format,
                 );
                 queue.present(frame);
-                window.request_redraw();
             }
             _ => {}
         }
