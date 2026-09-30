@@ -337,6 +337,30 @@ fn spirv_bytes(
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+/// Pipeline options for the MSL artifact: every entry point is written
+/// (`set_metal_names` zips the translated names positionally), and vertex
+/// attributes stay `[[stage_in]]`.
+///
+/// wgpu-hal's Metal backend binds vertex data two ways: it always configures
+/// an `MTLVertexDescriptor` from the pipeline's vertex buffers — which feeds
+/// `stage_in` attributes for any module, passthrough included — and it binds
+/// the buffers themselves at `MAX_BUFFERS - 1 - i` for naga's vertex-pulling
+/// transform. Pulling is not available to a build-time artifact anyway: it
+/// requires the pipeline's `vertex_buffer_mappings` (strides, step modes,
+/// attribute offsets and formats), which are only known when the pipeline is
+/// created, and naga asserts a non-zero stride for each mapping.
+/// `allow_and_force_point_size` is likewise pipeline-specific — wgpu-hal sets
+/// it only for point topologies — so it stays off.
+fn msl_pipeline_options() -> msl::PipelineOptions {
+    msl::PipelineOptions {
+        entry_point: None,
+        allow_and_force_point_size: false,
+        vertex_pulling_transform: false,
+        vertex_buffer_mappings: Vec::new(),
+        ..Default::default()
+    }
+}
+
 fn generate_msl(
     module: &Module,
     info: &ModuleInfo,
@@ -344,13 +368,14 @@ fn generate_msl(
     label: &str,
 ) -> (String, (u8, u8), Vec<String>) {
     let mut options = reflection.msl_options();
+    let pipeline_options = msl_pipeline_options();
     let mut versions = MSL_LANGUAGE_VERSIONS.iter().copied();
     let (source, translation, language_version) = loop {
         let version = versions.next().unwrap_or_else(|| {
             panic!("MSL generation failed for {label}: no supported Metal language version")
         });
         options.lang_version = version;
-        match msl::write_string(module, info, &options, &msl::PipelineOptions::default()) {
+        match msl::write_string(module, info, &options, &pipeline_options) {
             Ok((source, translation)) => break (source, translation, version),
             Err(error) if is_msl_version_error(&error) => {}
             Err(error) => panic!("MSL generation failed for {label}: {error}"),
@@ -1283,6 +1308,21 @@ mod tests {
                 binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
             }
         );
+    }
+
+    /// The MSL artifact keeps `[[stage_in]]` vertex inputs: wgpu-hal feeds
+    /// them through the `MTLVertexDescriptor` it configures for any pipeline
+    /// with vertex buffers, while its vertex-pulling transform needs
+    /// `vertex_buffer_mappings` that only exist at pipeline-creation time.
+    #[test]
+    fn msl_pipeline_options_keep_stage_in_vertex_inputs() {
+        let options = msl_pipeline_options();
+
+        assert!(options.entry_point.is_none());
+        assert!(!options.vertex_pulling_transform);
+        assert!(options.vertex_buffer_mappings.is_empty());
+        assert!(!options.allow_and_force_point_size);
+        assert!(options.binding_array_length_map.is_empty());
     }
 
     /// Descriptor bindings are numbered densely, the way wgpu numbers them.
