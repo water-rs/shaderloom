@@ -33,6 +33,9 @@ struct FlameApp {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     config: Option<wgpu::SurfaceConfiguration>,
+    /// Set when a surface acquire reports the window is not drawable; parks
+    /// the redraw chain until an event reports it drawable again.
+    occluded: bool,
 }
 
 impl FlameApp {
@@ -140,7 +143,22 @@ impl ApplicationHandler for FlameApp {
     ) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = occluded;
+                if !occluded && let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::Focused(true) => {
+                // Some platforms surface visibility only through focus.
+                self.occluded = false;
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Resized(_) => {
+                // Likewise, a resize can be the only drawable signal given.
+                self.occluded = false;
                 self.configure_surface();
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
@@ -156,16 +174,28 @@ impl ApplicationHandler for FlameApp {
                 ) else {
                     return;
                 };
-                // Queue the next frame before anything else: every early
-                // return below must leave the redraw chain alive.
-                window.request_redraw();
+                // Queue the next frame unless the last acquire parked us:
+                // every early return below must leave the chain alive or
+                // deliberately park it (occlusion stops the requests).
+                if !self.occluded {
+                    window.request_redraw();
+                }
                 let size = window.inner_size();
                 if size.width == 0 || size.height == 0 {
                     return;
                 }
                 let frame = match surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(frame)
-                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                        if self.occluded {
+                            // A probe redraw landed while parked and the
+                            // window is drawable again: hand the chain back
+                            // to the top-of-arm request for next iteration.
+                            self.occluded = false;
+                            window.request_redraw();
+                        }
+                        frame
+                    }
                     wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                         self.configure_surface();
                         if let Some(window) = self.window.as_ref() {
@@ -173,8 +203,16 @@ impl ApplicationHandler for FlameApp {
                         }
                         return;
                     }
-                    wgpu::CurrentSurfaceTexture::Timeout
-                    | wgpu::CurrentSurfaceTexture::Occluded => {
+                    wgpu::CurrentSurfaceTexture::Timeout => {
+                        // Transient GPU condition — the redraw queued above
+                        // retries it once.
+                        return;
+                    }
+                    wgpu::CurrentSurfaceTexture::Occluded => {
+                        // The window is not drawable (minimized or hidden):
+                        // park until `Occluded(false)`, `Resized`, or
+                        // `Focused(true)` queues a probe redraw.
+                        self.occluded = true;
                         return;
                     }
                     wgpu::CurrentSurfaceTexture::Validation => {
