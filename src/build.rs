@@ -337,6 +337,30 @@ fn spirv_bytes(
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
+/// Pipeline options for the MSL artifact: every entry point is written
+/// (`set_metal_names` zips the translated names positionally), and vertex
+/// attributes stay `[[stage_in]]`.
+///
+/// wgpu-hal's Metal backend binds vertex data two ways: it always configures
+/// an `MTLVertexDescriptor` from the pipeline's vertex buffers — which feeds
+/// `stage_in` attributes for any module, passthrough included — and it binds
+/// the buffers themselves at `MAX_BUFFERS - 1 - i` for naga's vertex-pulling
+/// transform. Pulling is not available to a build-time artifact anyway: it
+/// requires the pipeline's `vertex_buffer_mappings` (strides, step modes,
+/// attribute offsets and formats), which are only known when the pipeline is
+/// created, and naga asserts a non-zero stride for each mapping.
+/// `allow_and_force_point_size` is likewise pipeline-specific — wgpu-hal sets
+/// it only for point topologies — so it stays off.
+fn msl_pipeline_options() -> msl::PipelineOptions {
+    msl::PipelineOptions {
+        entry_point: None,
+        allow_and_force_point_size: false,
+        vertex_pulling_transform: false,
+        vertex_buffer_mappings: Vec::new(),
+        ..Default::default()
+    }
+}
+
 fn generate_msl(
     module: &Module,
     info: &ModuleInfo,
@@ -344,13 +368,14 @@ fn generate_msl(
     label: &str,
 ) -> (String, (u8, u8), Vec<String>) {
     let mut options = reflection.msl_options();
+    let pipeline_options = msl_pipeline_options();
     let mut versions = MSL_LANGUAGE_VERSIONS.iter().copied();
     let (source, translation, language_version) = loop {
         let version = versions.next().unwrap_or_else(|| {
             panic!("MSL generation failed for {label}: no supported Metal language version")
         });
         options.lang_version = version;
-        match msl::write_string(module, info, &options, &msl::PipelineOptions::default()) {
+        match msl::write_string(module, info, &options, &pipeline_options) {
             Ok((source, translation)) => break (source, translation, version),
             Err(error) if is_msl_version_error(&error) => {}
             Err(error) => panic!("MSL generation failed for {label}: {error}"),
@@ -423,6 +448,7 @@ const MSL_LANGUAGE_VERSIONS: &[(u8, u8)] = &[
     (3, 0),
     (3, 1),
     (3, 2),
+    (4, 0),
 ];
 
 const fn is_msl_version_error(error: &msl::Error) -> bool {
@@ -430,8 +456,8 @@ const fn is_msl_version_error(error: &msl::Error) -> bool {
         error,
         msl::Error::UnsupportedAttribute(_)
             | msl::Error::UnsupportedFunction(_)
-            | msl::Error::UnsupportedWriteableStorageBuffer
-            | msl::Error::UnsupportedWriteableStorageTexture(_)
+            | msl::Error::UnsupportedWritableStorageBuffer
+            | msl::Error::UnsupportedWritableStorageTexture(_)
             | msl::Error::UnsupportedRWStorageTexture
             | msl::Error::UnsupportedArrayOf(_)
             | msl::Error::UnsupportedRayTracing
@@ -638,11 +664,13 @@ impl ShaderReflection {
     /// - `task_dispatch_limits` is `None`, since those limits come from the
     ///   device.
     ///
-    /// Bounds checks, loop bounding, ray-query initialization tracking and
-    /// mesh-shader index clamping are all off. A passthrough binary is a trusted
-    /// module, and wgpu drops exactly these checks for trusted modules in
-    /// `wgpu_hal::vulkan::Device::compile_stage`; the MSL and HLSL options above
-    /// take the same position.
+    /// Bounds checks, loop bounding, ray-query initialization tracking,
+    /// integer-division checks and mesh-shader index clamping are all off. A
+    /// passthrough binary is a trusted module, and wgpu drops exactly these
+    /// checks for trusted modules in `wgpu_hal::vulkan::Device::compile_stage`;
+    /// the MSL and HLSL options above take the same position.
+    /// `trace_ray_argument_validation` is not a runtime check — wgpu enables it
+    /// unconditionally and never drops it — so it stays on.
     ///
     /// `binding_map` reproduces the remapping wgpu performs: `wgpu-core` sorts a
     /// bind group's entries by binding number and `wgpu-hal` then numbers the
@@ -689,6 +717,8 @@ impl ShaderReflection {
             debug_info: None,
             task_dispatch_limits: None,
             mesh_shader_primitive_indices_clamp: false,
+            trace_ray_argument_validation: true,
+            emit_int_div_checks: false,
         }
     }
 
@@ -780,6 +810,10 @@ impl ShaderReflection {
                 binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
             },
             force_loop_bounding: false,
+            task_dispatch_limits: None,
+            mesh_shader_primitive_indices_clamp: false,
+            ray_query_initialization_tracking: false,
+            emit_int_div_checks: false,
             ..Default::default()
         }
     }
@@ -861,6 +895,8 @@ impl ShaderReflection {
             restrict_indexing: false,
             force_loop_bounding: false,
             ray_query_initialization_tracking: false,
+            task_dispatch_limits: None,
+            mesh_shader_primitive_indices_clamp: false,
             ..Default::default()
         }
     }
@@ -1261,6 +1297,8 @@ mod tests {
         assert!(!options.fake_missing_bindings);
         assert!(!options.use_storage_input_output_16);
         assert!(!options.force_loop_bounding);
+        assert!(!options.emit_int_div_checks);
+        assert!(options.trace_ray_argument_validation);
         assert_eq!(
             options.bounds_check_policies,
             naga::proc::BoundsCheckPolicies {
@@ -1270,6 +1308,21 @@ mod tests {
                 binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
             }
         );
+    }
+
+    /// The MSL artifact keeps `[[stage_in]]` vertex inputs: wgpu-hal feeds
+    /// them through the `MTLVertexDescriptor` it configures for any pipeline
+    /// with vertex buffers, while its vertex-pulling transform needs
+    /// `vertex_buffer_mappings` that only exist at pipeline-creation time.
+    #[test]
+    fn msl_pipeline_options_keep_stage_in_vertex_inputs() {
+        let options = msl_pipeline_options();
+
+        assert!(options.entry_point.is_none());
+        assert!(!options.vertex_pulling_transform);
+        assert!(options.vertex_buffer_mappings.is_empty());
+        assert!(!options.allow_and_force_point_size);
+        assert!(options.binding_array_length_map.is_empty());
     }
 
     /// Descriptor bindings are numbered densely, the way wgpu numbers them.

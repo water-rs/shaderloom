@@ -30,28 +30,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # The workspace-wide check compiles the flame example's framework graph:
-      # khronos-egl probes egl.pc, gbm-sys/pipewire-sys/cros-libva/wayland-sys
-      # probe their pkg-config names (xcap -> waterkit-screen), and ash needs
-      # the Vulkan loader and a lavapipe ICD. xcb's build script wants
-      # libxcb1-dev. `cargo tree -e normal,build,dev --workspace --target
-      # x86_64-unknown-linux-gnu` shows no xkbcommon-sys, fontconfig, or alsa.
+      # The workspace-wide check compiles the flame example's windowing graph:
+      # khronos-egl probes egl.pc (wgpu's GLES backend), winit's wayland-sys
+      # probes wayland-client.pc, and ash needs the Vulkan loader and a
+      # lavapipe ICD at run time. `cargo tree -e normal,build,dev --workspace
+      # --target x86_64-unknown-linux-gnu` shows the set.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl-dev libgbm-dev libpipewire-0.3-dev \
             libxcb1-dev libva-dev libwayland-dev mesa-vulkan-drivers libvulkan1
-      # `filtrate` (waterui-graphics -> example) runs dxc from its build script
-      # to compile WGSL to DXIL; the Windows runner image does not ship it.
+      # `flame-example`'s build script runs dxc to compile WGSL to DXIL; the
+      # Windows runner image does not ship it.
       - name: Install DirectX Shader Compiler
         if: runner.os == 'Windows'
         uses: ./.github/actions/install-dxc
       - uses: Swatinem/rust-cache@v2
-      # The example's `dev` feature turns on the framework's dynamic linking,
-      # which links the whole framework into one dylib; on Windows that trips
-      # MSVC's 65535-object library limit (LNK1189). The example builds with its
-      # default features, and `--all-features` stays on the component itself.
       - uses: taiki-e/install-action@nextest
       - run: cargo nextest run -p shaderloom --all-features
       - run: cargo test -p shaderloom --doc --all-features
