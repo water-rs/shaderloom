@@ -423,6 +423,7 @@ const MSL_LANGUAGE_VERSIONS: &[(u8, u8)] = &[
     (3, 0),
     (3, 1),
     (3, 2),
+    (4, 0),
 ];
 
 const fn is_msl_version_error(error: &msl::Error) -> bool {
@@ -430,8 +431,8 @@ const fn is_msl_version_error(error: &msl::Error) -> bool {
         error,
         msl::Error::UnsupportedAttribute(_)
             | msl::Error::UnsupportedFunction(_)
-            | msl::Error::UnsupportedWriteableStorageBuffer
-            | msl::Error::UnsupportedWriteableStorageTexture(_)
+            | msl::Error::UnsupportedWritableStorageBuffer
+            | msl::Error::UnsupportedWritableStorageTexture(_)
             | msl::Error::UnsupportedRWStorageTexture
             | msl::Error::UnsupportedArrayOf(_)
             | msl::Error::UnsupportedRayTracing
@@ -638,11 +639,13 @@ impl ShaderReflection {
     /// - `task_dispatch_limits` is `None`, since those limits come from the
     ///   device.
     ///
-    /// Bounds checks, loop bounding, ray-query initialization tracking and
-    /// mesh-shader index clamping are all off. A passthrough binary is a trusted
-    /// module, and wgpu drops exactly these checks for trusted modules in
-    /// `wgpu_hal::vulkan::Device::compile_stage`; the MSL and HLSL options above
-    /// take the same position.
+    /// Bounds checks, loop bounding, ray-query initialization tracking,
+    /// integer-division checks and mesh-shader index clamping are all off. A
+    /// passthrough binary is a trusted module, and wgpu drops exactly these
+    /// checks for trusted modules in `wgpu_hal::vulkan::Device::compile_stage`;
+    /// the MSL and HLSL options above take the same position.
+    /// `trace_ray_argument_validation` is not a runtime check — wgpu enables it
+    /// unconditionally and never drops it — so it stays on.
     ///
     /// `binding_map` reproduces the remapping wgpu performs: `wgpu-core` sorts a
     /// bind group's entries by binding number and `wgpu-hal` then numbers the
@@ -689,6 +692,8 @@ impl ShaderReflection {
             debug_info: None,
             task_dispatch_limits: None,
             mesh_shader_primitive_indices_clamp: false,
+            trace_ray_argument_validation: true,
+            emit_int_div_checks: false,
         }
     }
 
@@ -780,6 +785,10 @@ impl ShaderReflection {
                 binding_array: naga::proc::BoundsCheckPolicy::Unchecked,
             },
             force_loop_bounding: false,
+            task_dispatch_limits: None,
+            mesh_shader_primitive_indices_clamp: false,
+            ray_query_initialization_tracking: false,
+            emit_int_div_checks: false,
             ..Default::default()
         }
     }
@@ -861,6 +870,8 @@ impl ShaderReflection {
             restrict_indexing: false,
             force_loop_bounding: false,
             ray_query_initialization_tracking: false,
+            task_dispatch_limits: None,
+            mesh_shader_primitive_indices_clamp: false,
             ..Default::default()
         }
     }
@@ -1261,6 +1272,8 @@ mod tests {
         assert!(!options.fake_missing_bindings);
         assert!(!options.use_storage_input_output_16);
         assert!(!options.force_loop_bounding);
+        assert!(!options.emit_int_div_checks);
+        assert!(options.trace_ray_argument_validation);
         assert_eq!(
             options.bounds_check_policies,
             naga::proc::BoundsCheckPolicies {

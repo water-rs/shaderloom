@@ -126,8 +126,11 @@ impl CompiledShader {
                         device,
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(self.label),
+                            entry_points: passthrough_entry_points(std::iter::once((
+                                entry_point.metal_name,
+                                entry_point.workgroup_size,
+                            ))),
                             metallib: Some(Cow::Borrowed(metallib)),
-                            num_workgroups: entry_point.workgroup_size,
                             ..Default::default()
                         },
                     ),
@@ -145,8 +148,11 @@ impl CompiledShader {
                         device,
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(self.label),
+                            entry_points: passthrough_entry_points(std::iter::once((
+                                entry_point.name,
+                                entry_point.workgroup_size,
+                            ))),
                             spirv: Some(Cow::Borrowed(spirv)),
-                            num_workgroups: entry_point.workgroup_size,
                             ..Default::default()
                         },
                     ),
@@ -167,8 +173,13 @@ impl CompiledShader {
                         device,
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: Some(self.label),
+                            // wgpu validates that a DXIL module declares exactly
+                            // one entry point.
+                            entry_points: passthrough_entry_points(std::iter::once((
+                                entry_point.name,
+                                entry_point.workgroup_size,
+                            ))),
                             dxil: Some(Cow::Borrowed(dxil)),
-                            num_workgroups: entry_point.workgroup_size,
                             ..Default::default()
                         },
                     ),
@@ -247,6 +258,13 @@ impl CompiledShader {
                     device,
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
+                        entry_points: passthrough_entry_points(
+                            std::iter::once((vertex.metal_name, vertex.workgroup_size)).chain(
+                                fragments
+                                    .iter()
+                                    .map(|entry| (entry.metal_name, entry.workgroup_size)),
+                            ),
+                        ),
                         metallib: Some(Cow::Borrowed(metallib)),
                         ..Default::default()
                     },
@@ -267,6 +285,13 @@ impl CompiledShader {
                     device,
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
+                        entry_points: passthrough_entry_points(
+                            std::iter::once((vertex.name, vertex.workgroup_size)).chain(
+                                fragments
+                                    .iter()
+                                    .map(|entry| (entry.name, entry.workgroup_size)),
+                            ),
+                        ),
                         spirv: Some(Cow::Borrowed(spirv)),
                         ..Default::default()
                     },
@@ -475,6 +500,28 @@ fn require_passthrough(device: &wgpu::Device, label: &str) {
     );
 }
 
+/// Builds the entry-point table a passthrough descriptor declares for the
+/// artifact it loads: the backend-facing name of every entry point the caller
+/// will use, with its workgroup size (zeroed on non-compute stages).
+///
+/// wgpu validates a pipeline's entry point against this list, and the Metal
+/// backend takes the compute grid size from it, keyed by the same name the
+/// pipeline passes — the translated Metal name, not the WGSL one.
+#[cfg(not(target_arch = "wasm32"))]
+fn passthrough_entry_points(
+    entry_points: impl IntoIterator<Item = (&'static str, (u32, u32, u32))>,
+) -> Cow<'static, [wgpu::PassthroughShaderEntryPoint<'static>]> {
+    Cow::Owned(
+        entry_points
+            .into_iter()
+            .map(|(name, workgroup_size)| wgpu::PassthroughShaderEntryPoint {
+                name: Cow::Borrowed(name),
+                workgroup_size,
+            })
+            .collect(),
+    )
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn create_passthrough_module(
     device: &wgpu::Device,
@@ -531,7 +578,7 @@ fn backend(device: &wgpu::Device) -> Backend {
         return Backend::Gles;
     }
 
-    panic!("WaterUI embedded shaders do not support this wgpu backend")
+    panic!("shaderloom embedded shaders do not support this wgpu backend")
 }
 
 /// Includes a generated SPIR-V artifact on targets that can select Vulkan.

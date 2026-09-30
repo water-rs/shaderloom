@@ -1,34 +1,189 @@
+//! Cinematic HDR flame: film buffer + bloom + ACES tonemap, drawn with a
+//! `shaderloom` compiled shader and presented by `winit` + `wgpu`.
+//!
+//! Run with `cargo run -p flame-example`.
+
+use std::sync::Arc;
 use std::time::Instant;
 
 use shaderloom::{CompiledShader, CompiledShaderModule};
-use waterui::app::App;
-use waterui::graphics::{GpuContext, GpuFrame, GpuSurface, GpuView, bytemuck};
-use waterui::prelude::*;
-use waterui::preview;
-
-#[preview]
-pub fn demo() -> impl View {
-    vstack((
-        text("Cinematic HDR Flame (GpuSurface)")
-            .size(24)
-            .foreground(Color::srgb(245, 247, 250)),
-        text("HDR film buffer + bloom + ACES tonemap")
-            .size(14)
-            .foreground(Color::srgb(210, 216, 224)),
-        GpuSurface::new(FlameRenderer::default()).size(400.0, 500.0),
-        text("Rendered at 120fps")
-            .size(12)
-            .foreground(Color::srgb(210, 216, 224)),
-    ))
-    .background(Color::srgb(31, 35, 38))
-    .padding()
-}
-
-pub fn app(env: Environment) -> App {
-    App::new(demo, env)
-}
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
 
 const FILM_SHADER: CompiledShader = include!(concat!(env!("OUT_DIR"), "/film.rs"));
+
+fn main() {
+    let event_loop = EventLoop::new().expect("failed to create the event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = FlameApp::default();
+    event_loop.run_app(&mut app).expect("event loop failed");
+}
+
+#[derive(Default)]
+struct FlameApp {
+    renderer: FlameRenderer,
+    window: Option<Arc<Window>>,
+    surface: Option<wgpu::Surface<'static>>,
+    device: Option<wgpu::Device>,
+    queue: Option<wgpu::Queue>,
+    config: Option<wgpu::SurfaceConfiguration>,
+}
+
+impl FlameApp {
+    fn configure_surface(&mut self) {
+        // `wgpu::Surface` is not `Clone`, so the fields are borrowed instead of
+        // cloned out; the disjoint `self.renderer` borrow stays legal.
+        let (Some(surface), Some(device), Some(queue), Some(window), Some(config)) = (
+            self.surface.as_ref(),
+            self.device.as_ref(),
+            self.queue.as_ref(),
+            self.window.as_ref(),
+            self.config.as_ref(),
+        ) else {
+            return;
+        };
+        let mut config = config.clone();
+        let size = window.inner_size();
+        config.width = size.width.max(1);
+        config.height = size.height.max(1);
+        surface.configure(device, &config);
+        self.config = Some(config.clone());
+        self.renderer
+            .ensure_targets(device, queue, config.width, config.height);
+    }
+}
+
+impl ApplicationHandler for FlameApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_title("shaderloom flame")
+                        .with_inner_size(winit::dpi::LogicalSize::new(400.0, 500.0)),
+                )
+                .expect("failed to create the window"),
+        );
+
+        let instance = wgpu::Instance::default();
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("failed to create the surface");
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        }))
+        .expect("no adapter supports the surface");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: shaderloom::required_features(adapter.features()),
+            ..Default::default()
+        }))
+        .expect("failed to create a device");
+
+        let capabilities = surface.get_capabilities(&adapter);
+        let format = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|format| matches!(format, wgpu::TextureFormat::Rgba16Float))
+            .unwrap_or_else(|| {
+                capabilities
+                    .formats
+                    .first()
+                    .copied()
+                    .expect("the surface advertises at least one format")
+            });
+        let size = window.inner_size();
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode: capabilities
+                .present_modes
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::PresentMode::AutoVsync)
+                .unwrap_or(wgpu::PresentMode::Fifo),
+            desired_maximum_frame_latency: 2,
+            alpha_mode: capabilities.alpha_modes[0],
+            view_formats: vec![],
+        };
+        surface.configure(&device, &config);
+
+        self.renderer.setup(&device, format);
+        self.renderer
+            .ensure_targets(&device, &queue, config.width, config.height);
+
+        self.window = Some(window);
+        self.surface = Some(surface);
+        self.device = Some(device);
+        self.queue = Some(queue);
+        self.config = Some(config);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => self.configure_surface(),
+            WindowEvent::RedrawRequested => {
+                let (Some(window), Some(surface), Some(device), Some(queue), Some(config)) = (
+                    self.window.as_ref(),
+                    self.surface.as_ref(),
+                    self.device.as_ref(),
+                    self.queue.as_ref(),
+                    self.config.as_ref(),
+                ) else {
+                    return;
+                };
+                let size = window.inner_size();
+                if size.width == 0 || size.height == 0 {
+                    return;
+                }
+                let frame = match surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(frame)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                    wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                        self.configure_surface();
+                        return;
+                    }
+                    wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded => {
+                        return;
+                    }
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        panic!("failed to acquire the next frame: validation error");
+                    }
+                };
+                let view = frame
+                    .texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                self.renderer.render(
+                    device,
+                    queue,
+                    &view,
+                    config.width,
+                    config.height,
+                    config.format,
+                );
+                queue.present(frame);
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+}
 
 struct FlameRenderer {
     last_tick: Instant,
@@ -99,8 +254,14 @@ impl FlameRenderer {
     const GLOBALS_SIZE: u64 = std::mem::size_of::<[f32; 12]>() as u64;
     const BLUR_PARAMS_SIZE: u64 = std::mem::size_of::<[f32; 4]>() as u64;
 
-    fn ensure_targets(&mut self, frame: &GpuFrame) {
-        if self.size == (frame.width, frame.height)
+    fn ensure_targets(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+    ) {
+        if self.size == (width, height)
             && self.film_view.is_some()
             && self.bloom_down_view.is_some()
             && self.bloom_temp_view.is_some()
@@ -113,16 +274,16 @@ impl FlameRenderer {
             return;
         }
 
-        self.size = (frame.width, frame.height);
+        self.size = (width, height);
 
-        let bloom_w = (frame.width / 2).max(1);
-        let bloom_h = (frame.height / 2).max(1);
+        let bloom_w = (width / 2).max(1);
+        let bloom_h = (height / 2).max(1);
 
-        let film = frame.device.create_texture(&wgpu::TextureDescriptor {
+        let film = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flame Film HDR"),
             size: wgpu::Extent3d {
-                width: frame.width.max(1),
-                height: frame.height.max(1),
+                width: width.max(1),
+                height: height.max(1),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -134,7 +295,7 @@ impl FlameRenderer {
         });
         let film_view = film.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bloom_down = frame.device.create_texture(&wgpu::TextureDescriptor {
+        let bloom_down = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flame Bloom Downsample"),
             size: wgpu::Extent3d {
                 width: bloom_w,
@@ -150,7 +311,7 @@ impl FlameRenderer {
         });
         let bloom_down_view = bloom_down.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bloom_temp = frame.device.create_texture(&wgpu::TextureDescriptor {
+        let bloom_temp = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flame Bloom Blur Temp"),
             size: wgpu::Extent3d {
                 width: bloom_w,
@@ -166,7 +327,7 @@ impl FlameRenderer {
         });
         let bloom_temp_view = bloom_temp.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bloom_blur = frame.device.create_texture(&wgpu::TextureDescriptor {
+        let bloom_blur = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Flame Bloom Blurred"),
             size: wgpu::Extent3d {
                 width: bloom_w,
@@ -193,7 +354,7 @@ impl FlameRenderer {
         };
 
         // Bind film + blurred bloom (bloom is ignored by the downsample pass).
-        let sample_bind_group = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let sample_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Flame Sample Bind Group"),
             layout: sample_layout,
             entries: &[
@@ -215,7 +376,7 @@ impl FlameRenderer {
         });
 
         // Final composite needs the blurred bloom.
-        let final_bind_group = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let final_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Flame Final Bind Group"),
             layout: sample_layout,
             entries: &[
@@ -235,13 +396,13 @@ impl FlameRenderer {
         });
 
         // Blur params (two bind groups with fixed directions).
-        let blur_x_buffer = frame.device.create_buffer(&wgpu::BufferDescriptor {
+        let blur_x_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Flame Blur Params X"),
             size: Self::BLUR_PARAMS_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let blur_y_buffer = frame.device.create_buffer(&wgpu::BufferDescriptor {
+        let blur_y_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Flame Blur Params Y"),
             size: Self::BLUR_PARAMS_SIZE,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -252,14 +413,10 @@ impl FlameRenderer {
         let texel_size = (1.0 / bloom_w as f32, 1.0 / bloom_h as f32);
         let blur_x: [f32; 4] = [texel_size.0, texel_size.1, 1.0, 0.0];
         let blur_y: [f32; 4] = [texel_size.0, texel_size.1, 0.0, 1.0];
-        frame
-            .queue
-            .write_buffer(&blur_x_buffer, 0, bytemuck::bytes_of(&blur_x));
-        frame
-            .queue
-            .write_buffer(&blur_y_buffer, 0, bytemuck::bytes_of(&blur_y));
+        queue.write_buffer(&blur_x_buffer, 0, bytemuck::bytes_of(&blur_x));
+        queue.write_buffer(&blur_y_buffer, 0, bytemuck::bytes_of(&blur_y));
 
-        let blur_x_bind_group = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let blur_x_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Flame Blur X Bind Group"),
             layout: blur_layout,
             entries: &[
@@ -277,7 +434,7 @@ impl FlameRenderer {
                 },
             ],
         });
-        let blur_y_bind_group = frame.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let blur_y_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Flame Blur Y Bind Group"),
             layout: blur_layout,
             entries: &[
@@ -307,15 +464,13 @@ impl FlameRenderer {
         self.blur_x_bind_group = Some(blur_x_bind_group);
         self.blur_y_bind_group = Some(blur_y_bind_group);
     }
-}
 
-impl GpuView for FlameRenderer {
-    async fn setup(&mut self, ctx: &GpuContext<'_>, _env: &mut waterui::Environment) {
+    fn setup(&mut self, device: &wgpu::Device, surface_format: wgpu::TextureFormat) {
         self.last_tick = Instant::now();
         self.sim_time = 0.0;
 
         let (vertex_shader, fragment_shaders) = FILM_SHADER.create_render_entry_points(
-            ctx.device,
+            device,
             "vs_main",
             &["fs_flame", "fs_downsample", "fs_blur", "fs_final"],
         );
@@ -325,30 +480,28 @@ impl GpuView for FlameRenderer {
             .expect("four flame fragment entry points were requested");
 
         let globals_size = Self::GLOBALS_SIZE;
-        let globals_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Flame Globals"),
             size: globals_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let globals_layout =
-            ctx.device
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Flame Globals Layout"),
-                    entries: &[wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: core::num::NonZeroU64::new(globals_size),
-                        },
-                        count: None,
-                    }],
-                });
+        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Flame Globals Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: core::num::NonZeroU64::new(globals_size),
+                },
+                count: None,
+            }],
+        });
 
-        let globals_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let globals_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Flame Globals Bind Group"),
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
@@ -357,7 +510,7 @@ impl GpuView for FlameRenderer {
             }],
         });
 
-        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Flame Linear Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -368,227 +521,211 @@ impl GpuView for FlameRenderer {
             ..Default::default()
         });
 
-        let sample_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Flame Sample Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+        let sample_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Flame Sample Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let blur_size = Self::BLUR_PARAMS_SIZE;
-        let blur_layout = ctx
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Flame Blur Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: core::num::NonZeroU64::new(blur_size),
-                        },
-                        count: None,
+        let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Flame Blur Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: core::num::NonZeroU64::new(blur_size),
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
 
         let flame_pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Flame Pipeline Layout"),
-                    bind_group_layouts: &[Some(&globals_layout)],
-                    immediate_size: 0,
-                });
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Flame Pipeline Layout"),
+                bind_group_layouts: &[Some(&globals_layout)],
+                immediate_size: 0,
+            });
 
         let composite_pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Flame Composite Layout"),
-                    bind_group_layouts: &[Some(&globals_layout), Some(&sample_layout)],
-                    immediate_size: 0,
-                });
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Flame Composite Layout"),
+                bind_group_layouts: &[Some(&globals_layout), Some(&sample_layout)],
+                immediate_size: 0,
+            });
 
         // Blur shader uses @group(2), so we must provide layouts for groups 0..=2.
-        let blur_pipeline_layout =
-            ctx.device
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Flame Blur Pipeline Layout"),
-                    bind_group_layouts: &[
-                        Some(&globals_layout),
-                        Some(&sample_layout),
-                        Some(&blur_layout),
-                    ],
-                    immediate_size: 0,
-                });
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Flame Blur Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&globals_layout),
+                Some(&sample_layout),
+                Some(&blur_layout),
+            ],
+            immediate_size: 0,
+        });
 
-        let flame_pipeline = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Flame Pass Pipeline"),
-                layout: Some(&flame_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: vertex_shader.module(),
-                    entry_point: Some(vertex_shader.entry_point()),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: flame_shader.module(),
-                    entry_point: Some(flame_shader.entry_point()),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: Self::FILM_FORMAT,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+        let flame_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Flame Pass Pipeline"),
+            layout: Some(&flame_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: vertex_shader.module(),
+                entry_point: Some(vertex_shader.entry_point()),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: flame_shader.module(),
+                entry_point: Some(flame_shader.entry_point()),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: Self::FILM_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
-        let downsample_pipeline =
-            ctx.device
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("Flame Bloom Downsample Pipeline"),
-                    layout: Some(&composite_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: vertex_shader.module(),
-                        entry_point: Some(vertex_shader.entry_point()),
-                        buffers: &[],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: downsample_shader.module(),
-                        entry_point: Some(downsample_shader.entry_point()),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: Self::FILM_FORMAT,
-                            blend: Some(wgpu::BlendState::REPLACE),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
-                });
+        let downsample_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Flame Bloom Downsample Pipeline"),
+            layout: Some(&composite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: vertex_shader.module(),
+                entry_point: Some(vertex_shader.entry_point()),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: downsample_shader.module(),
+                entry_point: Some(downsample_shader.entry_point()),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: Self::FILM_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
-        let blur_pipeline = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Flame Bloom Blur Pipeline"),
-                layout: Some(&blur_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: vertex_shader.module(),
-                    entry_point: Some(vertex_shader.entry_point()),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: blur_shader.module(),
-                    entry_point: Some(blur_shader.entry_point()),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: Self::FILM_FORMAT,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+        let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Flame Bloom Blur Pipeline"),
+            layout: Some(&blur_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: vertex_shader.module(),
+                entry_point: Some(vertex_shader.entry_point()),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: blur_shader.module(),
+                entry_point: Some(blur_shader.entry_point()),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: Self::FILM_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
-        let final_pipeline = ctx
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Flame Final Pipeline"),
-                layout: Some(&composite_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: vertex_shader.module(),
-                    entry_point: Some(vertex_shader.entry_point()),
-                    buffers: &[],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: final_shader.module(),
-                    entry_point: Some(final_shader.entry_point()),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: ctx.surface_format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
+        let final_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Flame Final Pipeline"),
+            layout: Some(&composite_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: vertex_shader.module(),
+                entry_point: Some(vertex_shader.entry_point()),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: final_shader.module(),
+                entry_point: Some(final_shader.entry_point()),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         self.globals_buffer = Some(globals_buffer);
         self.globals_bind_group = Some(globals_bind_group);
@@ -601,11 +738,19 @@ impl GpuView for FlameRenderer {
         self.downsample_pipeline = Some(downsample_pipeline);
         self.blur_pipeline = Some(blur_pipeline);
         self.final_pipeline = Some(final_pipeline);
-        self.final_format = Some(ctx.surface_format);
+        self.final_format = Some(surface_format);
     }
 
-    fn render(&mut self, frame: &mut GpuFrame) {
-        if self.final_format != Some(frame.format) {
+    fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        if self.final_format != Some(format) {
             // Surface format changed (unexpected) — force re-setup on next frame.
             self.flame_pipeline = None;
             self.downsample_pipeline = None;
@@ -616,7 +761,7 @@ impl GpuView for FlameRenderer {
         }
 
         // Lazily create/recreate intermediate targets and bind groups.
-        self.ensure_targets(frame);
+        self.ensure_targets(device, queue, width, height);
 
         let Some(globals_buffer) = &self.globals_buffer else {
             return;
@@ -674,9 +819,12 @@ impl GpuView for FlameRenderer {
 
         // Update globals.
         let elapsed = self.sim_time;
-        let is_hdr = frame.is_hdr();
+        let is_hdr = matches!(
+            format,
+            wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgba32Float
+        );
         #[allow(clippy::cast_precision_loss)]
-        let (w, h) = (frame.width as f32, frame.height as f32);
+        let (w, h) = (width as f32, height as f32);
 
         // HDR tuning: bigger highlight range + tighter bloom (to keep detail).
         let edr_gain = if is_hdr { 6.0 } else { 1.0 };
@@ -700,15 +848,11 @@ impl GpuView for FlameRenderer {
             1.0 / w.max(1.0),
             1.0 / h.max(1.0),
         ];
-        frame
-            .queue
-            .write_buffer(globals_buffer, 0, bytemuck::bytes_of(&globals));
+        queue.write_buffer(globals_buffer, 0, bytemuck::bytes_of(&globals));
 
-        let mut encoder = frame
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Flame Film Encoder"),
-            });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Flame Film Encoder"),
+        });
 
         // Pass 1: flame -> HDR film buffer.
         {
@@ -812,7 +956,7 @@ impl GpuView for FlameRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Final Composite Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &frame.view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -831,7 +975,6 @@ impl GpuView for FlameRenderer {
             pass.draw(0..6, 0..1);
         }
 
-        frame.queue.submit(std::iter::once(encoder.finish()));
-        frame.request_redraw();
+        queue.submit(std::iter::once(encoder.finish()));
     }
 }
