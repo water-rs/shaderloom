@@ -1320,7 +1320,10 @@ mod tests {
 
         assert!(options.entry_point.is_none());
         assert!(!options.vertex_pulling_transform);
-        assert!(options.vertex_buffer_mappings.is_empty());
+        assert_eq!(
+            options.vertex_buffer_mappings,
+            [] as [naga::back::msl::VertexBufferMapping; 0]
+        );
         assert!(!options.allow_and_force_point_size);
         assert!(options.binding_array_length_map.is_empty());
     }
