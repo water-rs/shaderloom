@@ -3,20 +3,19 @@ name = "flame-example"
 version = "0.1.0"
 edition = "2024"
 authors = ["Lexo Liu"]
-description = "Flame example for WaterUI framework"
+description = "Flame example: a build-time compiled shader rendered by winit and wgpu"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/water-rs/shaderloom"
-keywords = ["ui", "framework", "example", "flame"]
-categories = ["gui"]
+keywords = ["wgpu", "shader", "example", "flame"]
+categories = ["graphics"]
 publish = false
 
-[features]
-dev = ["waterui/dynamic_linking"]
-
 [dependencies]
-waterui = "0.4.1"
 shaderloom = { path = "../.." }
-wgpu = "29.0.4"
+wgpu = "30.0.1"
+winit = "0.30"
+pollster = "0.4"
+bytemuck = "1"
 
 [build-dependencies]
 shaderloom = { path = "../..", features = ["build"] }
