@@ -4,8 +4,9 @@
 target artifact in the final binary, and loads it through `wgpu` without a
 runtime WGSL translation step on native backends.
 
-The crate is independent from `WaterUI`. Its runtime dependency is only `wgpu`;
-the optional `build` feature adds `naga` for build scripts.
+The crate is independent from `WaterUI`. Its default feature set enables only
+the runtime API, whose dependency is `wgpu` alone; the `build` feature, meant
+for a `[build-dependencies]` entry, adds `naga` for build scripts.
 
 That `naga` is the one `wgpu` itself links, and each backend's writer options
 are matched to the options `wgpu` would have used for the same module at
@@ -35,7 +36,7 @@ Add the lightweight runtime dependency and the build-enabled build dependency:
 shaderloom = "0.1"
 
 [build-dependencies]
-shaderloom = { version = "0.1", features = ["build"] }
+shaderloom = { version = "0.1", default-features = false, features = ["build"] }
 ```
 
 The snippets below are shown rather than compiled: they run in a `build.rs`,
@@ -45,7 +46,8 @@ or need a live `wgpu` adapter.
 Compile a WGSL module from `build.rs`:
 
 ```rust,ignore
-// build.rs, with `features = ["build"]` on the build-dependency.
+// build.rs, with `default-features = false, features = ["build"]` on the
+// build-dependency.
 shaderloom::build::compile_wgsl_shader("src/particles.wgsl", "particles");
 ```
 
