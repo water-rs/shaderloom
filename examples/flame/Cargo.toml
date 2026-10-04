@@ -18,7 +18,7 @@ pollster = "0.4"
 bytemuck = "1"
 
 [build-dependencies]
-shaderloom = { path = "../..", features = ["build"] }
+shaderloom = { path = "../..", default-features = false, features = ["build"] }
 
 # `shaderloom` is used directly by build.rs; cargo-machete 0.9 does not scan build.rs.
 [package.metadata.cargo-machete]

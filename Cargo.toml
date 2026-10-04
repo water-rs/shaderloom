@@ -38,7 +38,10 @@ path = "src/bin/shaderloom.rs"
 required-features = ["build"]
 
 [features]
-default = ["runtime", "build"]
+# `build` pulls the WGSL compiler and the Rust-code generator into whichever
+# dependency edge names it, so the default set enables the runtime API alone
+# and a normal dependency never links them.
+default = ["runtime"]
 # Runtime shader-module API (`CompiledShader`, `WgslModuleCache`, …) — the only
 # part of the crate that links `wgpu`.
 runtime = ["dep:wgpu"]
