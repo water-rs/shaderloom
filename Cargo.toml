@@ -1,3 +1,7 @@
+[workspace]
+members = ["examples/flame"]
+resolver = "2"
+
 [package]
 name = "shaderloom"
 version = "0.1.2"
@@ -12,17 +16,39 @@ keywords = ["wgpu", "shader", "wgsl", "metallib", "spirv"]
 categories = ["graphics", "development-tools::build-utils"]
 
 [dependencies]
-wgpu = "29.0.4"
-naga = { version = "29.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
+wgpu = { version = "30.0.1", optional = true }
+naga = { version = "30.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
+# The packaged-shader manifest is TOML, shared between the `build` writer and
+# the always-compiled `packaged` reader.
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+quote = { version = "1", optional = true }
+proc-macro2 = { version = "1", optional = true }
+syn = { version = "3", optional = true, features = ["full", "parsing"] }
+prettyplease = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # The SPIR-V opcode table, so the writer-option tests name opcodes from the
 # specification instead of restating their numbers. Same version naga uses.
 spirv = "0.4"
 
+[[bin]]
+name = "shaderloom"
+path = "src/bin/shaderloom.rs"
+required-features = ["build"]
+
 [features]
-default = []
-build = ["dep:naga"]
+# `build` pulls the WGSL compiler and the Rust-code generator into whichever
+# dependency edge names it, so the default set enables the runtime API alone
+# and a normal dependency never links them.
+default = ["runtime"]
+# Runtime shader-module API (`CompiledShader`, `WgslModuleCache`, …) — the only
+# part of the crate that links `wgpu`.
+runtime = ["dep:wgpu"]
+# Build-script API (`shaderloom::build`) and the `shaderloom` CLI. Declare it
+# with `default-features = false` so the host side compiles `naga` without
+# `wgpu`.
+build = ["dep:naga", "dep:quote", "dep:proc-macro2", "dep:syn", "dep:prettyplease"]
 
 [package.metadata.docs.rs]
 all-features = true
