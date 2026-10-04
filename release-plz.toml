@@ -18,3 +18,4 @@ git_release_name = "v{{ version }}"
 [[package]]
 name = "flame-example"
 release = false
+publish = false
