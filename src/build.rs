@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::packaged::{
-    DxilEntry, PackagedManifest, apple_sdk, metal_language_standard, required_env, run_tool,
+    DxilEntry, PackagedManifest, apple_sdk, metal_language_standard, metal_target, required_env,
+    run_tool,
 };
 use naga::back::{hlsl, msl, spv};
 use naga::valid::{Capabilities, ModuleInfo, ValidationFlags, Validator};
@@ -419,6 +420,8 @@ fn compile_metallib(
         Command::new("xcrun")
             .args(["--sdk", sdk, "metal", "-c"])
             .arg(standard)
+            .arg("-target")
+            .arg(metal_target(target_os))
             .arg(&source_path)
             .arg("-o")
             .arg(&air_path),

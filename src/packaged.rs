@@ -51,6 +51,8 @@ pub fn compile_packaged_metallib(packaged_dir: &str, artifact_name: &str) {
         Command::new("xcrun")
             .args(["--sdk", sdk, "metal", "-c"])
             .arg(standard)
+            .arg("-target")
+            .arg(metal_target(&target_os))
             .arg(&source_path)
             .arg("-o")
             .arg(&air_path),
@@ -176,18 +178,130 @@ pub(crate) fn metal_language_standard(target_os: &str, version: (u8, u8)) -> Str
     format!("-std={prefix}{}.{}", version.0, version.1)
 }
 
-pub(crate) fn apple_sdk(target_os: &str) -> &'static str {
+/// The Apple platform a Cargo target builds for, shared by SDK selection
+/// (`xcrun --sdk`) and the Metal driver's `-target` triple so the two can
+/// never disagree.
+#[derive(Debug, Clone, Copy)]
+enum ApplePlatform {
+    MacOs,
+    Ios,
+    IosSimulator,
+    /// Mac Catalyst: the `ios` target OS with a `macabi` ABI, built with the
+    /// macOS SDK.
+    MacCatalyst,
+    Tvos,
+    TvosSimulator,
+    Watchos,
+    WatchosSimulator,
+    Visionos,
+    VisionosSimulator,
+}
+
+impl ApplePlatform {
+    /// The `xcrun --sdk` name for the platform.
+    const fn sdk(self) -> &'static str {
+        match self {
+            Self::MacOs | Self::MacCatalyst => "macosx",
+            Self::Ios => "iphoneos",
+            Self::IosSimulator => "iphonesimulator",
+            Self::Tvos => "appletvos",
+            Self::TvosSimulator => "appletvsimulator",
+            Self::Watchos => "watchos",
+            Self::WatchosSimulator => "watchsimulator",
+            Self::Visionos => "xros",
+            Self::VisionosSimulator => "xrsimulator",
+        }
+    }
+
+    /// The OS component of a Metal driver `-target` triple.
+    const fn metal_os(self) -> &'static str {
+        match self {
+            Self::MacOs => "macos",
+            Self::Ios | Self::IosSimulator | Self::MacCatalyst => "ios",
+            Self::Tvos | Self::TvosSimulator => "tvos",
+            Self::Watchos | Self::WatchosSimulator => "watchos",
+            Self::Visionos | Self::VisionosSimulator => "visionos",
+        }
+    }
+
+    /// The environment suffix of a Metal driver `-target` triple.
+    const fn metal_suffix(self) -> &'static str {
+        match self {
+            Self::MacCatalyst => "-macabi",
+            Self::IosSimulator
+            | Self::TvosSimulator
+            | Self::WatchosSimulator
+            | Self::VisionosSimulator => "-simulator",
+            _ => "",
+        }
+    }
+}
+
+/// Maps cargo's target OS and triple to the Apple platform the shader
+/// toolchain builds for. A `*-sim` triple or an `x86_64` Apple triple —
+/// Intel simulator targets predate the `-sim` suffix — selects the simulator
+/// platform. Mac Catalyst is the `ios` target OS with the `macabi` ABI
+/// (`CARGO_CFG_TARGET_ABI`); it is checked before the simulator rule, which
+/// `x86_64-apple-ios-macabi` would otherwise trip.
+fn apple_platform(target_os: &str) -> ApplePlatform {
     let target = required_env("TARGET");
+    let simulator = target.contains("-sim") || target.starts_with("x86_64-");
+    let macabi = required_env("CARGO_CFG_TARGET_ABI") == "macabi";
     match target_os {
-        "macos" => "macosx",
-        "ios" if target.contains("-sim") || target.starts_with("x86_64-") => "iphonesimulator",
-        "ios" => "iphoneos",
-        "tvos" if target.contains("-sim") || target.starts_with("x86_64-") => "appletvsimulator",
-        "tvos" => "appletvos",
-        "watchos" if target.contains("-sim") || target.starts_with("x86_64-") => "watchsimulator",
-        "watchos" => "watchos",
-        "visionos" if target.contains("-sim") => "xrsimulator",
-        "visionos" => "xros",
+        "macos" => ApplePlatform::MacOs,
+        "ios" if macabi => ApplePlatform::MacCatalyst,
+        "ios" if simulator => ApplePlatform::IosSimulator,
+        "ios" => ApplePlatform::Ios,
+        "tvos" if simulator => ApplePlatform::TvosSimulator,
+        "tvos" => ApplePlatform::Tvos,
+        "watchos" if simulator => ApplePlatform::WatchosSimulator,
+        "watchos" => ApplePlatform::Watchos,
+        "visionos" if simulator => ApplePlatform::VisionosSimulator,
+        "visionos" => ApplePlatform::Visionos,
         other => panic!("unsupported Apple shader target OS '{other}'"),
     }
+}
+
+pub(crate) fn apple_sdk(target_os: &str) -> &'static str {
+    apple_platform(target_os).sdk()
+}
+
+/// The `-target` triple for the Metal driver, for example
+/// `air64-apple-ios14.0-simulator`.
+///
+/// Without an explicit target the driver infers the platform and OS version
+/// from whichever `*_DEPLOYMENT_TARGET` variables are in the environment, so
+/// a workspace that declares more than one of them can compile an
+/// `aarch64-apple-ios-sim` shader against a runtime library that does not
+/// exist (`libmetal_rt_osxsim.a`). The platform instead comes from the same
+/// cargo configuration that selects the SDK, and the OS version comes from
+/// the compiler: `rustc --print deployment-target` honours the platform's
+/// `*_DEPLOYMENT_TARGET` variable — whose name it prints, becoming the
+/// `rerun-if-env-changed` — and otherwise reports rustc's default.
+pub(crate) fn metal_target(target_os: &str) -> String {
+    let platform = apple_platform(target_os);
+    let target = required_env("TARGET");
+    let output = Command::new(required_env("RUSTC"))
+        .args(["--print", "deployment-target", "--target", &target])
+        .output()
+        .unwrap_or_else(|error| {
+            panic!("failed to query the rustc deployment target for {target}: {error}")
+        });
+    assert!(
+        output.status.success(),
+        "rustc --print deployment-target failed for {target}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout =
+        String::from_utf8(output.stdout).expect("rustc --print deployment-target must print UTF-8");
+    let (variable, version) = stdout
+        .trim()
+        .split_once('=')
+        .expect("rustc --print deployment-target must print <VAR>=<version>");
+    println!("cargo:rerun-if-env-changed={variable}");
+    format!(
+        "air64-apple-{}{version}{}",
+        platform.metal_os(),
+        platform.metal_suffix()
+    )
 }
