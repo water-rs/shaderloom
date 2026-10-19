@@ -12,7 +12,6 @@ publish = false
 
 [dependencies]
 shaderloom = { path = "../.." }
-wgpu = "30.0.1"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = "1"

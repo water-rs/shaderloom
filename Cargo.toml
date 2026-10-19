@@ -16,7 +16,7 @@ keywords = ["wgpu", "shader", "wgsl", "metallib", "spirv"]
 categories = ["graphics", "development-tools::build-utils"]
 
 [dependencies]
-wgpu = { version = "30.0.1", optional = true }
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true }
 naga = { version = "30.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
 # The packaged-shader manifest is TOML, shared between the `build` writer and
 # the always-compiled `packaged` reader.
