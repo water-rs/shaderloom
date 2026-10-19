@@ -552,6 +552,7 @@ struct ReflectedEntryPoint {
     metal_name: std::cell::RefCell<String>,
     stage: ShaderStage,
     workgroup_size: [u32; 3],
+    workgroup_memory_sizes: Vec<u32>,
 }
 
 impl ReflectedEntryPoint {
@@ -611,11 +612,27 @@ impl ShaderReflection {
         let entry_points = module
             .entry_points
             .iter()
-            .map(|entry| ReflectedEntryPoint {
+            .enumerate()
+            .map(|(index, entry)| ReflectedEntryPoint {
                 name: entry.name.clone(),
                 metal_name: std::cell::RefCell::new(entry.name.clone()),
                 stage: entry.stage,
                 workgroup_size: entry.workgroup_size,
+                workgroup_memory_sizes: module
+                    .global_variables
+                    .iter()
+                    .filter(|(handle, global)| {
+                        global.space == AddressSpace::WorkGroup
+                            && !info.get_entry_point(index)[*handle].is_empty()
+                    })
+                    .map(|(_, global)| {
+                        module.types[global.ty]
+                            .inner
+                            .size(module.to_ctx())
+                            .div_ceil(16)
+                            * 16
+                    })
+                    .collect(),
             })
             .collect();
 
@@ -937,12 +954,18 @@ impl ShaderReflection {
             let stage = rust_stage(entry.stage);
             let metal_name = entry.metal_name.borrow().clone();
             let workgroup = entry.workgroup_size.map(Literal::u32_unsuffixed);
+            let memory_sizes = entry
+                .workgroup_memory_sizes
+                .iter()
+                .copied()
+                .map(Literal::u32_unsuffixed);
             quote! {
                 ::shaderloom::CompiledEntryPoint {
                     name: #name,
                     stage: #stage,
                     metal_name: #metal_name,
                     workgroup_size: (#(#workgroup),*),
+                    workgroup_memory_sizes: &[#(#memory_sizes),*],
                     dxil: ::shaderloom::include_compiled_dxil!(#dxil),
                 }
             }
@@ -1197,6 +1220,15 @@ mod tests {
             .expect("test WGSL must validate");
         let reflection = ShaderReflection::new(&module, &info);
         (module, info, reflection)
+    }
+
+    #[test]
+    fn reflection_preserves_entry_point_workgroup_allocations() {
+        let (_, _, reflection) = parse_and_reflect(include_str!("shader_test_workgroup.wgsl"));
+        assert_eq!(reflection.entry_points[0].workgroup_memory_sizes, [16, 48]);
+        assert_eq!(reflection.entry_points[1].workgroup_memory_sizes, [48]);
+        let rust = reflection.rust_expression("workgroup.wgsl", "workgroup", &IncludeRoot::OutDir);
+        assert!(rust.contains("workgroup_memory_sizes: &[16, 48]"));
     }
 
     /// Opcodes of every instruction in a SPIR-V module.

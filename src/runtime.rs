@@ -14,6 +14,8 @@ pub struct CompiledEntryPoint {
     pub metal_name: &'static str,
     /// Compute workgroup size. Non-compute entry points use zeroes.
     pub workgroup_size: (u32, u32, u32),
+    /// Metal threadgroup allocation sizes, in argument order.
+    pub workgroup_memory_sizes: &'static [u32],
     /// Stage-specific DXIL bytecode.
     pub dxil: Option<&'static [u8]>,
 }
@@ -128,7 +130,7 @@ impl CompiledShader {
                             label: Some(self.label),
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.metal_name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             metallib: Some(Cow::Borrowed(metallib)),
                             ..Default::default()
@@ -150,7 +152,7 @@ impl CompiledShader {
                             label: Some(self.label),
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             spirv: Some(Cow::Borrowed(spirv)),
                             ..Default::default()
@@ -177,7 +179,7 @@ impl CompiledShader {
                             // one entry point.
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             dxil: Some(Cow::Borrowed(dxil)),
                             ..Default::default()
@@ -259,11 +261,8 @@ impl CompiledShader {
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
                         entry_points: passthrough_entry_points(
-                            std::iter::once((vertex.metal_name, vertex.workgroup_size)).chain(
-                                fragments
-                                    .iter()
-                                    .map(|entry| (entry.metal_name, entry.workgroup_size)),
-                            ),
+                            std::iter::once((vertex.metal_name, vertex))
+                                .chain(fragments.iter().map(|entry| (entry.metal_name, *entry))),
                         ),
                         metallib: Some(Cow::Borrowed(metallib)),
                         ..Default::default()
@@ -286,11 +285,8 @@ impl CompiledShader {
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
                         entry_points: passthrough_entry_points(
-                            std::iter::once((vertex.name, vertex.workgroup_size)).chain(
-                                fragments
-                                    .iter()
-                                    .map(|entry| (entry.name, entry.workgroup_size)),
-                            ),
+                            std::iter::once((vertex.name, vertex))
+                                .chain(fragments.iter().map(|entry| (entry.name, *entry))),
                         ),
                         spirv: Some(Cow::Borrowed(spirv)),
                         ..Default::default()
@@ -508,15 +504,16 @@ fn require_passthrough(device: &wgpu::Device, label: &str) {
 /// backend takes the compute grid size from it, keyed by the same name the
 /// pipeline passes — the translated Metal name, not the WGSL one.
 #[cfg(not(target_arch = "wasm32"))]
-fn passthrough_entry_points(
-    entry_points: impl IntoIterator<Item = (&'static str, (u32, u32, u32))>,
+fn passthrough_entry_points<'a>(
+    entry_points: impl IntoIterator<Item = (&'static str, &'a CompiledEntryPoint)>,
 ) -> Cow<'static, [wgpu::PassthroughShaderEntryPoint<'static>]> {
     Cow::Owned(
         entry_points
             .into_iter()
-            .map(|(name, workgroup_size)| wgpu::PassthroughShaderEntryPoint {
+            .map(|(name, entry)| wgpu::PassthroughShaderEntryPoint {
                 name: Cow::Borrowed(name),
-                workgroup_size,
+                workgroup_size: entry.workgroup_size,
+                workgroup_memory_sizes: Cow::Borrowed(entry.workgroup_memory_sizes),
             })
             .collect(),
     )
