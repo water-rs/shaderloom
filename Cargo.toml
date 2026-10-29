@@ -16,7 +16,7 @@ keywords = ["wgpu", "shader", "wgsl", "metallib", "spirv"]
 categories = ["graphics", "development-tools::build-utils"]
 
 [dependencies]
-wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true }
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl", "webgpu"] }
 naga = { version = "30.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
 # The packaged-shader manifest is TOML, shared between the `build` writer and
 # the always-compiled `packaged` reader.
@@ -26,6 +26,9 @@ quote = { version = "1", optional = true }
 proc-macro2 = { version = "1", optional = true }
 syn = { version = "3", optional = true, features = ["full", "parsing"] }
 prettyplease = { version = "0.3", optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["gles"] }
 
 [dev-dependencies]
 # The SPIR-V opcode table, so the writer-option tests name opcodes from the
@@ -45,6 +48,8 @@ default = ["runtime"]
 # Runtime shader-module API (`CompiledShader`, `WgslModuleCache`, …) — the only
 # part of the crate that links `wgpu`.
 runtime = ["dep:wgpu"]
+# Optional native GLES support and its embedded WGSL source.
+gles = ["runtime", "wgpu/gles"]
 # Build-script API (`shaderloom::build`) and the `shaderloom` CLI. Declare it
 # with `default-features = false` so the host side compiles `naga` without
 # `wgpu`.
