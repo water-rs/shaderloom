@@ -51,7 +51,7 @@ pub struct ReflectedBindGroup {
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledShader {
     label: &'static str,
-    wgsl: &'static str,
+    wgsl: Option<&'static str>,
     #[cfg_attr(
         any(target_arch = "wasm32", target_vendor = "apple"),
         expect(dead_code, reason = "Apple and WebGPU artifacts do not select SPIR-V")
@@ -71,7 +71,7 @@ impl CompiledShader {
     #[must_use]
     pub const fn new(
         label: &'static str,
-        wgsl: &'static str,
+        wgsl: Option<&'static str>,
         spirv: Option<&'static [u32]>,
         metallib: Option<&'static [u8]>,
         entry_points: &'static [CompiledEntryPoint],
@@ -107,14 +107,28 @@ impl CompiledShader {
         let entry_point = self.entry_point(stage, name);
 
         match backend(device) {
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                not(target_vendor = "apple"),
+                any(feature = "gles", target_os = "windows")
+            ))]
             Backend::Gles => CompiledShaderModule {
-                module: create_wgsl_module(device, self.label, self.wgsl),
+                module: create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 entry_point: entry_point.name,
             },
             #[cfg(target_arch = "wasm32")]
             Backend::WebGpu => CompiledShaderModule {
-                module: create_wgsl_module(device, self.label, self.wgsl),
+                module: create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 entry_point: entry_point.name,
             },
             #[cfg(target_vendor = "apple")]
@@ -238,15 +252,29 @@ impl CompiledShader {
             .collect::<Vec<_>>();
 
         match backend(device) {
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                not(target_vendor = "apple"),
+                any(feature = "gles", target_os = "windows")
+            ))]
             Backend::Gles => shared_render_entry_points(
-                create_wgsl_module(device, self.label, self.wgsl),
+                create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 vertex.name,
                 fragments.iter().map(|entry| entry.name),
             ),
             #[cfg(target_arch = "wasm32")]
             Backend::WebGpu => shared_render_entry_points(
-                create_wgsl_module(device, self.label, self.wgsl),
+                create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 vertex.name,
                 fragments.iter().map(|entry| entry.name),
             ),
@@ -325,9 +353,9 @@ impl CompiledShader {
             .collect()
     }
 
-    /// Returns the build-validated WGSL for dynamic composition paths.
+    /// Returns compact WGSL when source delivery is enabled for this target.
     #[must_use]
-    pub const fn wgsl(&self) -> &'static str {
+    pub const fn wgsl(&self) -> Option<&'static str> {
         self.wgsl
     }
 
@@ -477,15 +505,6 @@ impl WgslModuleCache {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", not(target_vendor = "apple")))]
-fn create_wgsl_module(
-    device: &wgpu::Device,
-    label: &'static str,
-    source: &'static str,
-) -> wgpu::ShaderModule {
-    create_dynamic_wgsl_module(device, Some(label), source)
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn require_passthrough(device: &wgpu::Device, label: &str) {
     assert!(
@@ -533,7 +552,11 @@ fn create_passthrough_module(
 enum Backend {
     #[cfg(target_os = "windows")]
     Dx12,
-    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(target_vendor = "apple"),
+        any(feature = "gles", target_os = "windows")
+    ))]
     Gles,
     #[cfg(target_vendor = "apple")]
     Metal,
@@ -569,7 +592,10 @@ fn backend(device: &wgpu::Device) -> Backend {
         return Backend::Vulkan;
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(
+        not(target_vendor = "apple"),
+        any(feature = "gles", target_os = "windows")
+    ))]
     // SAFETY: as above — a backend probe whose handle never escapes.
     if unsafe { device.as_hal::<wgpu::hal::api::Gles>() }.is_some() {
         return Backend::Gles;
@@ -645,4 +671,22 @@ macro_rules! include_compiled_dxil {
             None
         }
     }};
+}
+
+/// Includes WGSL only when a selected backend consumes source shaders.
+#[cfg(any(feature = "gles", target_os = "windows", target_arch = "wasm32"))]
+#[macro_export]
+macro_rules! include_wgsl_source {
+    ($source:expr) => {
+        Some($source)
+    };
+}
+
+/// Omits WGSL from native builds that only load compiled shader artifacts.
+#[cfg(not(any(feature = "gles", target_os = "windows", target_arch = "wasm32")))]
+#[macro_export]
+macro_rules! include_wgsl_source {
+    ($source:expr) => {
+        None
+    };
 }
