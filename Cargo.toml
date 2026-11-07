@@ -16,7 +16,7 @@ keywords = ["wgpu", "shader", "wgsl", "metallib", "spirv"]
 categories = ["graphics", "development-tools::build-utils"]
 
 [dependencies]
-wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl", "webgpu"] }
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["std", "parking_lot", "wgsl"] }
 naga = { version = "30.0.1", optional = true, features = ["hlsl-out", "msl-out", "spv-out", "wgsl-in"] }
 # The packaged-shader manifest is TOML, shared between the `build` writer and
 # the always-compiled `packaged` reader.
@@ -27,8 +27,19 @@ proc-macro2 = { version = "1", optional = true }
 syn = { version = "3", optional = true, features = ["full", "parsing"] }
 prettyplease = { version = "0.3", optional = true }
 
+# Each target enables only its own wgpu backend; GLES comes from the `gles`
+# feature alone.
 [target.'cfg(target_os = "windows")'.dependencies]
-wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["gles"] }
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["dx12"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["metal"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wgpu = { version = "30.0.1", git = "https://github.com/water-rs/wgpu", branch = "fix/metal-shared-memory-v30", optional = true, default-features = false, features = ["webgpu"] }
 
 [dev-dependencies]
 # The SPIR-V opcode table, so the writer-option tests name opcodes from the

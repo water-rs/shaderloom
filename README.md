@@ -18,9 +18,9 @@ have produced, not merely something the driver happens to accept.
 | Runtime backend | Build-time artifact | Runtime input |
 | --- | --- | --- |
 | Metal | MSL, AIR, then `MetalLib` | `ShaderModuleDescriptorPassthrough::metallib` |
-| Direct3D 12 | Per-entry-point HLSL, then DXIL | `ShaderModuleDescriptorPassthrough::dxil` |
-| Vulkan | SPIR-V | `ShaderModuleDescriptorPassthrough::spirv` |
-| GLES | Validated WGSL | Standard `ShaderModuleDescriptor` |
+| Direct3D 12 (Windows) | Per-entry-point HLSL, then DXIL | `ShaderModuleDescriptorPassthrough::dxil` |
+| Vulkan (Linux, Android) | SPIR-V | `ShaderModuleDescriptorPassthrough::spirv` |
+| GLES (`gles` feature) | Validated WGSL | Standard `ShaderModuleDescriptor` |
 | Browser WebGPU | Validated WGSL | Standard `ShaderModuleDescriptor` |
 
 GLES and Browser WebGPU retain WGSL because `wgpu` does not expose a portable

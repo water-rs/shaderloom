@@ -21,8 +21,8 @@ use quote::quote;
 ///
 /// The generated Rust expression is written to `<OUT_DIR>/<artifact_name>.rs`.
 /// Native artifacts are emitted for every backend selectable on the Cargo
-/// target: `MetalLib` on Apple, DXIL and SPIR-V on Windows, and SPIR-V on other
-/// non-Web targets. WebGPU and GLES use the validated WGSL emitted alongside
+/// target: `MetalLib` on Apple, DXIL on Windows, and SPIR-V on Linux and
+/// Android. WebGPU and GLES use the validated WGSL emitted alongside
 /// the native artifacts because those APIs have no portable offline binary.
 ///
 /// # Panics
@@ -89,11 +89,10 @@ pub fn compile_wgsl_source(label: &str, source: &str, artifact_name: &str) {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     write_wgsl(&out_dir, artifact_name, source, label);
 
-    let target_arch = required_env("CARGO_CFG_TARGET_ARCH");
     let target_os = required_env("CARGO_CFG_TARGET_OS");
     let target_vendor = required_env("CARGO_CFG_TARGET_VENDOR");
 
-    if target_arch != "wasm32" && target_vendor != "apple" {
+    if matches!(target_os.as_str(), "linux" | "android") {
         compile_spirv(
             &module,
             &info,
