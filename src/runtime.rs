@@ -53,8 +53,8 @@ pub struct CompiledShader {
     label: &'static str,
     wgsl: Option<&'static str>,
     #[cfg_attr(
-        any(target_arch = "wasm32", target_vendor = "apple"),
-        expect(dead_code, reason = "Apple and WebGPU artifacts do not select SPIR-V")
+        not(any(target_os = "linux", target_os = "android")),
+        expect(dead_code, reason = "only Linux and Android targets select SPIR-V")
     )]
     spirv: Option<&'static [u32]>,
     #[cfg_attr(
@@ -110,7 +110,7 @@ impl CompiledShader {
             #[cfg(all(
                 not(target_arch = "wasm32"),
                 not(target_vendor = "apple"),
-                any(feature = "gles", target_os = "windows")
+                feature = "gles"
             ))]
             Backend::Gles => CompiledShaderModule {
                 module: create_dynamic_wgsl_module(
@@ -153,7 +153,7 @@ impl CompiledShader {
                     entry_point: entry_point.metal_name,
                 }
             }
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Backend::Vulkan => {
                 require_passthrough(device, self.label);
                 let spirv = self
@@ -255,7 +255,7 @@ impl CompiledShader {
             #[cfg(all(
                 not(target_arch = "wasm32"),
                 not(target_vendor = "apple"),
-                any(feature = "gles", target_os = "windows")
+                feature = "gles"
             ))]
             Backend::Gles => shared_render_entry_points(
                 create_dynamic_wgsl_module(
@@ -302,7 +302,7 @@ impl CompiledShader {
                     fragments.iter().map(|entry| entry.metal_name),
                 )
             }
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Backend::Vulkan => {
                 require_passthrough(device, self.label);
                 let spirv = self
@@ -555,12 +555,12 @@ enum Backend {
     #[cfg(all(
         not(target_arch = "wasm32"),
         not(target_vendor = "apple"),
-        any(feature = "gles", target_os = "windows")
+        feature = "gles"
     ))]
     Gles,
     #[cfg(target_vendor = "apple")]
     Metal,
-    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     Vulkan,
     #[cfg(target_arch = "wasm32")]
     WebGpu,
@@ -586,16 +586,13 @@ fn backend(device: &wgpu::Device) -> Backend {
         return Backend::Dx12;
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as above — a backend probe whose handle never escapes.
     if unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }.is_some() {
         return Backend::Vulkan;
     }
 
-    #[cfg(all(
-        not(target_vendor = "apple"),
-        any(feature = "gles", target_os = "windows")
-    ))]
+    #[cfg(all(not(target_vendor = "apple"), feature = "gles"))]
     // SAFETY: as above — a backend probe whose handle never escapes.
     if unsafe { device.as_hal::<wgpu::hal::api::Gles>() }.is_some() {
         return Backend::Gles;
@@ -604,11 +601,12 @@ fn backend(device: &wgpu::Device) -> Backend {
     panic!("shaderloom embedded shaders do not support this wgpu backend")
 }
 
-/// Includes a generated SPIR-V artifact on targets that can select Vulkan.
+/// Includes a generated SPIR-V artifact on Linux and Android, the targets that
+/// select Vulkan.
 #[macro_export]
 macro_rules! include_compiled_spirv {
     ($file:literal) => {{
-        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             Some(wgpu::include_spirv_source!(concat!(
                 env!("OUT_DIR"),
@@ -616,7 +614,7 @@ macro_rules! include_compiled_spirv {
                 $file
             )))
         }
-        #[cfg(any(target_arch = "wasm32", target_vendor = "apple"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             None
         }
@@ -624,11 +622,11 @@ macro_rules! include_compiled_spirv {
 }
 
 /// Includes a checked-in SPIR-V artifact — relative to the crate's manifest
-/// dir — on targets that can select Vulkan.
+/// dir — on Linux and Android, the targets that select Vulkan.
 #[macro_export]
 macro_rules! include_packaged_spirv {
     ($file:literal) => {{
-        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             Some(wgpu::include_spirv_source!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -636,7 +634,7 @@ macro_rules! include_packaged_spirv {
                 $file
             )))
         }
-        #[cfg(any(target_arch = "wasm32", target_vendor = "apple"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             None
         }
@@ -674,7 +672,7 @@ macro_rules! include_compiled_dxil {
 }
 
 /// Includes WGSL only when a selected backend consumes source shaders.
-#[cfg(any(feature = "gles", target_os = "windows", target_arch = "wasm32"))]
+#[cfg(any(feature = "gles", target_arch = "wasm32"))]
 #[macro_export]
 macro_rules! include_wgsl_source {
     ($source:expr) => {
@@ -683,7 +681,7 @@ macro_rules! include_wgsl_source {
 }
 
 /// Omits WGSL from native builds that only load compiled shader artifacts.
-#[cfg(not(any(feature = "gles", target_os = "windows", target_arch = "wasm32")))]
+#[cfg(not(any(feature = "gles", target_arch = "wasm32")))]
 #[macro_export]
 macro_rules! include_wgsl_source {
     ($source:expr) => {
