@@ -3,6 +3,7 @@
 //!
 //! Run with `cargo run -p flame-example`.
 
+use shaderloom::wgpu;
 use std::sync::Arc;
 use std::time::Instant;
 

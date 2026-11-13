@@ -21,8 +21,8 @@ use quote::quote;
 ///
 /// The generated Rust expression is written to `<OUT_DIR>/<artifact_name>.rs`.
 /// Native artifacts are emitted for every backend selectable on the Cargo
-/// target: `MetalLib` on Apple, DXIL and SPIR-V on Windows, and SPIR-V on other
-/// non-Web targets. WebGPU and GLES use the validated WGSL emitted alongside
+/// target: `MetalLib` on Apple, DXIL on Windows, and SPIR-V on Linux and
+/// Android. WebGPU and GLES use the validated WGSL emitted alongside
 /// the native artifacts because those APIs have no portable offline binary.
 ///
 /// # Panics
@@ -89,11 +89,10 @@ pub fn compile_wgsl_source(label: &str, source: &str, artifact_name: &str) {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     write_wgsl(&out_dir, artifact_name, source, label);
 
-    let target_arch = required_env("CARGO_CFG_TARGET_ARCH");
     let target_os = required_env("CARGO_CFG_TARGET_OS");
     let target_vendor = required_env("CARGO_CFG_TARGET_VENDOR");
 
-    if target_arch != "wasm32" && target_vendor != "apple" {
+    if matches!(target_os.as_str(), "linux" | "android") {
         compile_spirv(
             &module,
             &info,
@@ -173,7 +172,10 @@ pub fn package_wgsl(
     let reflection = ShaderReflection::new(&module, &info);
 
     let mut files = Vec::new();
-    files.push((format!("{artifact_name}.wgsl"), source.as_bytes().to_vec()));
+    files.push((
+        format!("{artifact_name}.wgsl"),
+        compact_wgsl(source).into_bytes(),
+    ));
     files.push((
         format!("{artifact_name}.spv"),
         spirv_bytes(&module, &info, &reflection, label),
@@ -311,9 +313,72 @@ fn assert_artifact_name(name: &str) {
     );
 }
 
+/// Compact validated WGSL trivia without changing identifiers or operators.
+fn compact_wgsl(source: &str) -> String {
+    let mut chars = source.chars().peekable();
+    let mut output = String::with_capacity(source.len());
+    let mut separated = false;
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            separated = true;
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for comment in chars.by_ref() {
+                if comment == '\n' {
+                    break;
+                }
+            }
+            separated = true;
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut depth = 1;
+            while depth != 0 {
+                match (
+                    chars.next().expect("validated WGSL comment is closed"),
+                    chars.peek(),
+                ) {
+                    ('/', Some('*')) => {
+                        chars.next();
+                        depth += 1;
+                    }
+                    ('*', Some('/')) => {
+                        chars.next();
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+            separated = true;
+            continue;
+        }
+        // These punctuation tokens cannot combine with an adjacent token.
+        // Keep separation around operators: `- -x` must not become `--x`.
+        let delimiter = |c| matches!(c, '{' | '}' | '(' | ')' | '[' | ']' | ',' | ';' | ':' | '@');
+        if separated
+            && output
+                .chars()
+                .next_back()
+                .is_some_and(|last| !delimiter(last))
+            && !delimiter(ch)
+        {
+            output.push(' ');
+        }
+        output.push(ch);
+        separated = false;
+    }
+    output
+}
+
 fn write_wgsl(dir: &Path, artifact_name: &str, source: &str, label: &str) {
-    fs::write(dir.join(format!("{artifact_name}.wgsl")), source)
-        .unwrap_or_else(|error| panic!("failed to write generated WGSL for {label}: {error}"));
+    fs::write(
+        dir.join(format!("{artifact_name}.wgsl")),
+        compact_wgsl(source),
+    )
+    .unwrap_or_else(|error| panic!("failed to write generated WGSL for {label}: {error}"));
 }
 
 fn compile_spirv(
@@ -552,6 +617,7 @@ struct ReflectedEntryPoint {
     metal_name: std::cell::RefCell<String>,
     stage: ShaderStage,
     workgroup_size: [u32; 3],
+    workgroup_memory_sizes: Vec<u32>,
 }
 
 impl ReflectedEntryPoint {
@@ -611,11 +677,27 @@ impl ShaderReflection {
         let entry_points = module
             .entry_points
             .iter()
-            .map(|entry| ReflectedEntryPoint {
+            .enumerate()
+            .map(|(index, entry)| ReflectedEntryPoint {
                 name: entry.name.clone(),
                 metal_name: std::cell::RefCell::new(entry.name.clone()),
                 stage: entry.stage,
                 workgroup_size: entry.workgroup_size,
+                workgroup_memory_sizes: module
+                    .global_variables
+                    .iter()
+                    .filter(|(handle, global)| {
+                        global.space == AddressSpace::WorkGroup
+                            && !info.get_entry_point(index)[*handle].is_empty()
+                    })
+                    .map(|(_, global)| {
+                        module.types[global.ty]
+                            .inner
+                            .size(module.to_ctx())
+                            .div_ceil(16)
+                            * 16
+                    })
+                    .collect(),
             })
             .collect();
 
@@ -915,7 +997,7 @@ impl ShaderReflection {
                 let wgsl = format!("/{artifact_name}.wgsl");
                 let spv = format!("{artifact_name}.spv");
                 (
-                    quote! { include_str!(concat!(env!("OUT_DIR"), #wgsl)) },
+                    quote! { ::shaderloom::include_wgsl_source!(include_str!(concat!(env!("OUT_DIR"), #wgsl))) },
                     quote! { ::shaderloom::include_compiled_spirv!(#spv) },
                 )
             }
@@ -923,7 +1005,7 @@ impl ShaderReflection {
                 let wgsl = format!("/{root}/{artifact_name}.wgsl");
                 let spv = format!("{root}/{artifact_name}.spv");
                 (
-                    quote! { include_str!(concat!(env!("CARGO_MANIFEST_DIR"), #wgsl)) },
+                    quote! { ::shaderloom::include_wgsl_source!(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), #wgsl))) },
                     quote! { ::shaderloom::include_packaged_spirv!(#spv) },
                 )
             }
@@ -937,12 +1019,18 @@ impl ShaderReflection {
             let stage = rust_stage(entry.stage);
             let metal_name = entry.metal_name.borrow().clone();
             let workgroup = entry.workgroup_size.map(Literal::u32_unsuffixed);
+            let memory_sizes = entry
+                .workgroup_memory_sizes
+                .iter()
+                .copied()
+                .map(Literal::u32_unsuffixed);
             quote! {
                 ::shaderloom::CompiledEntryPoint {
                     name: #name,
                     stage: #stage,
                     metal_name: #metal_name,
                     workgroup_size: (#(#workgroup),*),
+                    workgroup_memory_sizes: &[#(#memory_sizes),*],
                     dxil: ::shaderloom::include_compiled_dxil!(#dxil),
                 }
             }
@@ -1197,6 +1285,43 @@ mod tests {
             .expect("test WGSL must validate");
         let reflection = ShaderReflection::new(&module, &info);
         (module, info, reflection)
+    }
+
+    #[test]
+    fn compact_source_preserves_shader_interfaces_and_trivia_boundaries() {
+        for source in [
+            TEST_SHADER,
+            SPARSE_BINDING_SHADER,
+            include_str!("shader_test_trivia.wgsl"),
+        ] {
+            let (_, _, original) = parse_and_reflect(source);
+            let compact = compact_wgsl(source);
+            let (_, _, result) = parse_and_reflect(&compact);
+            assert!(compact.len() < source.len());
+            assert!(!compact.contains("/*") && !compact.contains("//"));
+            assert_eq!(result.bindings.len(), original.bindings.len());
+            assert_eq!(
+                result
+                    .entry_points
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .collect::<Vec<_>>(),
+                original
+                    .entry_points
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn reflection_preserves_entry_point_workgroup_allocations() {
+        let (_, _, reflection) = parse_and_reflect(include_str!("shader_test_workgroup.wgsl"));
+        assert_eq!(reflection.entry_points[0].workgroup_memory_sizes, [16, 48]);
+        assert_eq!(reflection.entry_points[1].workgroup_memory_sizes, [48]);
+        let rust = reflection.rust_expression("workgroup.wgsl", "workgroup", &IncludeRoot::OutDir);
+        assert!(rust.contains("workgroup_memory_sizes: &[16, 48]"));
     }
 
     /// Opcodes of every instruction in a SPIR-V module.

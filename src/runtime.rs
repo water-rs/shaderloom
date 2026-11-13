@@ -14,6 +14,8 @@ pub struct CompiledEntryPoint {
     pub metal_name: &'static str,
     /// Compute workgroup size. Non-compute entry points use zeroes.
     pub workgroup_size: (u32, u32, u32),
+    /// Metal threadgroup allocation sizes, in argument order.
+    pub workgroup_memory_sizes: &'static [u32],
     /// Stage-specific DXIL bytecode.
     pub dxil: Option<&'static [u8]>,
 }
@@ -49,10 +51,10 @@ pub struct ReflectedBindGroup {
 #[derive(Debug, Clone, Copy)]
 pub struct CompiledShader {
     label: &'static str,
-    wgsl: &'static str,
+    wgsl: Option<&'static str>,
     #[cfg_attr(
-        any(target_arch = "wasm32", target_vendor = "apple"),
-        expect(dead_code, reason = "Apple and WebGPU artifacts do not select SPIR-V")
+        not(any(target_os = "linux", target_os = "android")),
+        expect(dead_code, reason = "only Linux and Android targets select SPIR-V")
     )]
     spirv: Option<&'static [u32]>,
     #[cfg_attr(
@@ -69,7 +71,7 @@ impl CompiledShader {
     #[must_use]
     pub const fn new(
         label: &'static str,
-        wgsl: &'static str,
+        wgsl: Option<&'static str>,
         spirv: Option<&'static [u32]>,
         metallib: Option<&'static [u8]>,
         entry_points: &'static [CompiledEntryPoint],
@@ -105,14 +107,28 @@ impl CompiledShader {
         let entry_point = self.entry_point(stage, name);
 
         match backend(device) {
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                not(target_vendor = "apple"),
+                feature = "gles"
+            ))]
             Backend::Gles => CompiledShaderModule {
-                module: create_wgsl_module(device, self.label, self.wgsl),
+                module: create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 entry_point: entry_point.name,
             },
             #[cfg(target_arch = "wasm32")]
             Backend::WebGpu => CompiledShaderModule {
-                module: create_wgsl_module(device, self.label, self.wgsl),
+                module: create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 entry_point: entry_point.name,
             },
             #[cfg(target_vendor = "apple")]
@@ -128,7 +144,7 @@ impl CompiledShader {
                             label: Some(self.label),
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.metal_name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             metallib: Some(Cow::Borrowed(metallib)),
                             ..Default::default()
@@ -137,7 +153,7 @@ impl CompiledShader {
                     entry_point: entry_point.metal_name,
                 }
             }
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Backend::Vulkan => {
                 require_passthrough(device, self.label);
                 let spirv = self
@@ -150,7 +166,7 @@ impl CompiledShader {
                             label: Some(self.label),
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             spirv: Some(Cow::Borrowed(spirv)),
                             ..Default::default()
@@ -177,7 +193,7 @@ impl CompiledShader {
                             // one entry point.
                             entry_points: passthrough_entry_points(std::iter::once((
                                 entry_point.name,
-                                entry_point.workgroup_size,
+                                entry_point,
                             ))),
                             dxil: Some(Cow::Borrowed(dxil)),
                             ..Default::default()
@@ -236,15 +252,29 @@ impl CompiledShader {
             .collect::<Vec<_>>();
 
         match backend(device) {
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                not(target_vendor = "apple"),
+                feature = "gles"
+            ))]
             Backend::Gles => shared_render_entry_points(
-                create_wgsl_module(device, self.label, self.wgsl),
+                create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 vertex.name,
                 fragments.iter().map(|entry| entry.name),
             ),
             #[cfg(target_arch = "wasm32")]
             Backend::WebGpu => shared_render_entry_points(
-                create_wgsl_module(device, self.label, self.wgsl),
+                create_dynamic_wgsl_module(
+                    device,
+                    Some(self.label),
+                    self.wgsl
+                        .expect("WGSL artifact is required for this backend"),
+                ),
                 vertex.name,
                 fragments.iter().map(|entry| entry.name),
             ),
@@ -259,11 +289,8 @@ impl CompiledShader {
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
                         entry_points: passthrough_entry_points(
-                            std::iter::once((vertex.metal_name, vertex.workgroup_size)).chain(
-                                fragments
-                                    .iter()
-                                    .map(|entry| (entry.metal_name, entry.workgroup_size)),
-                            ),
+                            std::iter::once((vertex.metal_name, vertex))
+                                .chain(fragments.iter().map(|entry| (entry.metal_name, *entry))),
                         ),
                         metallib: Some(Cow::Borrowed(metallib)),
                         ..Default::default()
@@ -275,7 +302,7 @@ impl CompiledShader {
                     fragments.iter().map(|entry| entry.metal_name),
                 )
             }
-            #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Backend::Vulkan => {
                 require_passthrough(device, self.label);
                 let spirv = self
@@ -286,11 +313,8 @@ impl CompiledShader {
                     wgpu::ShaderModuleDescriptorPassthrough {
                         label: Some(self.label),
                         entry_points: passthrough_entry_points(
-                            std::iter::once((vertex.name, vertex.workgroup_size)).chain(
-                                fragments
-                                    .iter()
-                                    .map(|entry| (entry.name, entry.workgroup_size)),
-                            ),
+                            std::iter::once((vertex.name, vertex))
+                                .chain(fragments.iter().map(|entry| (entry.name, *entry))),
                         ),
                         spirv: Some(Cow::Borrowed(spirv)),
                         ..Default::default()
@@ -329,9 +353,9 @@ impl CompiledShader {
             .collect()
     }
 
-    /// Returns the build-validated WGSL for dynamic composition paths.
+    /// Returns compact WGSL when source delivery is enabled for this target.
     #[must_use]
-    pub const fn wgsl(&self) -> &'static str {
+    pub const fn wgsl(&self) -> Option<&'static str> {
         self.wgsl
     }
 
@@ -481,15 +505,6 @@ impl WgslModuleCache {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", not(target_vendor = "apple")))]
-fn create_wgsl_module(
-    device: &wgpu::Device,
-    label: &'static str,
-    source: &'static str,
-) -> wgpu::ShaderModule {
-    create_dynamic_wgsl_module(device, Some(label), source)
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn require_passthrough(device: &wgpu::Device, label: &str) {
     assert!(
@@ -508,15 +523,16 @@ fn require_passthrough(device: &wgpu::Device, label: &str) {
 /// backend takes the compute grid size from it, keyed by the same name the
 /// pipeline passes — the translated Metal name, not the WGSL one.
 #[cfg(not(target_arch = "wasm32"))]
-fn passthrough_entry_points(
-    entry_points: impl IntoIterator<Item = (&'static str, (u32, u32, u32))>,
+fn passthrough_entry_points<'a>(
+    entry_points: impl IntoIterator<Item = (&'static str, &'a CompiledEntryPoint)>,
 ) -> Cow<'static, [wgpu::PassthroughShaderEntryPoint<'static>]> {
     Cow::Owned(
         entry_points
             .into_iter()
-            .map(|(name, workgroup_size)| wgpu::PassthroughShaderEntryPoint {
+            .map(|(name, entry)| wgpu::PassthroughShaderEntryPoint {
                 name: Cow::Borrowed(name),
-                workgroup_size,
+                workgroup_size: entry.workgroup_size,
+                workgroup_memory_sizes: Cow::Borrowed(entry.workgroup_memory_sizes),
             })
             .collect(),
     )
@@ -536,11 +552,15 @@ fn create_passthrough_module(
 enum Backend {
     #[cfg(target_os = "windows")]
     Dx12,
-    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        not(target_vendor = "apple"),
+        feature = "gles"
+    ))]
     Gles,
     #[cfg(target_vendor = "apple")]
     Metal,
-    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     Vulkan,
     #[cfg(target_arch = "wasm32")]
     WebGpu,
@@ -566,13 +586,13 @@ fn backend(device: &wgpu::Device) -> Backend {
         return Backend::Dx12;
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     // SAFETY: as above — a backend probe whose handle never escapes.
     if unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() }.is_some() {
         return Backend::Vulkan;
     }
 
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(target_vendor = "apple"), feature = "gles"))]
     // SAFETY: as above — a backend probe whose handle never escapes.
     if unsafe { device.as_hal::<wgpu::hal::api::Gles>() }.is_some() {
         return Backend::Gles;
@@ -581,11 +601,12 @@ fn backend(device: &wgpu::Device) -> Backend {
     panic!("shaderloom embedded shaders do not support this wgpu backend")
 }
 
-/// Includes a generated SPIR-V artifact on targets that can select Vulkan.
+/// Includes a generated SPIR-V artifact on Linux and Android, the targets that
+/// select Vulkan.
 #[macro_export]
 macro_rules! include_compiled_spirv {
     ($file:literal) => {{
-        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             Some(wgpu::include_spirv_source!(concat!(
                 env!("OUT_DIR"),
@@ -593,7 +614,7 @@ macro_rules! include_compiled_spirv {
                 $file
             )))
         }
-        #[cfg(any(target_arch = "wasm32", target_vendor = "apple"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             None
         }
@@ -601,11 +622,11 @@ macro_rules! include_compiled_spirv {
 }
 
 /// Includes a checked-in SPIR-V artifact — relative to the crate's manifest
-/// dir — on targets that can select Vulkan.
+/// dir — on Linux and Android, the targets that select Vulkan.
 #[macro_export]
 macro_rules! include_packaged_spirv {
     ($file:literal) => {{
-        #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             Some(wgpu::include_spirv_source!(concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -613,7 +634,7 @@ macro_rules! include_packaged_spirv {
                 $file
             )))
         }
-        #[cfg(any(target_arch = "wasm32", target_vendor = "apple"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             None
         }
@@ -648,4 +669,22 @@ macro_rules! include_compiled_dxil {
             None
         }
     }};
+}
+
+/// Includes WGSL only when a selected backend consumes source shaders.
+#[cfg(any(feature = "gles", target_arch = "wasm32"))]
+#[macro_export]
+macro_rules! include_wgsl_source {
+    ($source:expr) => {
+        Some($source)
+    };
+}
+
+/// Omits WGSL from native builds that only load compiled shader artifacts.
+#[cfg(not(any(feature = "gles", target_arch = "wasm32")))]
+#[macro_export]
+macro_rules! include_wgsl_source {
+    ($source:expr) => {
+        None
+    };
 }
