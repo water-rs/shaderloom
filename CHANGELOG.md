@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/water-rs/shaderloom/compare/v0.2.1...v0.3.0) - 2026-11-14
+
+### Fixed
+
+- *(build)* enable only each target's own wgpu backend
+- *(runtime)* retain Metal workgroup memory allocations
+
+### Other
+
+- release from main and retire dev
+- [**breaking**] gate WGSL delivery and compact shader source
+- dispatch the release gate only when a release pull request exists
+- pass the release pull request's gate without CI
+
 ## [0.2.1](https://github.com/water-rs/shaderloom/compare/v0.2.0...v0.2.1) - 2026-10-08
 
 ### Fixed
